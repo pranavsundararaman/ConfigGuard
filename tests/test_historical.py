@@ -1,4 +1,6 @@
-from app.historical import analyze_historical_values
+import pytest
+
+from app.historical import MIN_HISTORICAL_OBSERVATIONS, analyze_historical_values
 
 
 def test_unusual_numeric_value_reports_transparent_advisory():
@@ -29,3 +31,21 @@ def test_non_numeric_and_missing_values_are_handled_safely():
 
     statuses = {item["parameter"]: item["status"] for item in result["results"]}
     assert statuses == {"mode": "not_assessed_non_numeric", "timeout": "insufficient_history"}
+
+
+def test_function_enforces_minimum_even_when_called_directly():
+    with pytest.raises(ValueError, match="at least 3"):
+        analyze_historical_values({"timeout": 10}, [{"timeout": 5}] * 4, min_observations=2)
+    assert MIN_HISTORICAL_OBSERVATIONS == 3
+
+
+def test_zero_mad_flags_a_different_value_but_not_the_median():
+    history = [{"retries": 4}, {"retries": 4}, {"retries": 4}]
+
+    unusual = analyze_historical_values({"retries": 5}, history)["results"][0]
+    ordinary = analyze_historical_values({"retries": 4}, history)["results"][0]
+
+    assert unusual["baseline_mad"] == 0
+    assert unusual["status"] == "unusual"
+    assert unusual["robust_deviation"] is None
+    assert ordinary["status"] == "within_historical_range"

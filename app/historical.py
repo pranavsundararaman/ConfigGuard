@@ -4,6 +4,8 @@ from typing import Any
 
 from .parser import flatten_config
 
+MIN_HISTORICAL_OBSERVATIONS = 3
+
 
 def _finite_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
@@ -12,7 +14,7 @@ def _finite_number(value: Any) -> bool:
 def analyze_historical_values(
     proposed: dict[str, Any],
     prior_configurations: list[dict[str, Any]],
-    min_observations: int = 3,
+    min_observations: int = MIN_HISTORICAL_OBSERVATIONS,
 ) -> dict[str, Any]:
     """Compare proposed numeric values with per-parameter historical baselines.
 
@@ -20,6 +22,15 @@ def analyze_historical_values(
     failure. Each parameter is evaluated only when enough numeric observations
     for that parameter are available.
     """
+    if (
+        isinstance(min_observations, bool)
+        or not isinstance(min_observations, int)
+        or min_observations < MIN_HISTORICAL_OBSERVATIONS
+    ):
+        raise ValueError(
+            f"min_observations must be at least {MIN_HISTORICAL_OBSERVATIONS}."
+        )
+
     proposed_flat = flatten_config(proposed)
     prior_flat = [flatten_config(config) for config in prior_configurations]
     results: list[dict[str, Any]] = []

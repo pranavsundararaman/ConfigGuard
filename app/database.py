@@ -1,29 +1,37 @@
 import os
+from threading import Lock
 
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
 load_dotenv()
 
-MONGODB_URI = os.getenv("MONGODB_URI")
-MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "configguard")
-
-if not MONGODB_URI:
-    raise RuntimeError("MONGODB_URI is missing from your .env file")
-
 client = None
-db = None
+_database = None
+_database_lock = Lock()
+
+
+class MongoConfigurationError(RuntimeError):
+    """Raised when a database operation is attempted without a configured URI."""
 
 
 def get_database():
     """Create the Mongo client on first database use, not during app import."""
-    global client, db
-    if db is None:
-        if not MONGODB_URI:
-            raise RuntimeError("MONGODB_URI is missing from your .env file")
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        db = client[MONGODB_DATABASE]
-    return db
+    global client, _database
+    if _database is not None:
+        return _database
+    with _database_lock:
+        if _database is not None:
+            return _database
+        uri = os.getenv("MONGODB_URI")
+        if not uri:
+            raise MongoConfigurationError(
+                "MongoDB is not configured. Set MONGODB_URI before using this operation."
+            )
+        database_name = os.getenv("MONGODB_DATABASE", "configguard")
+        client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        _database = client[database_name]
+        return _database
 
 
 class _LazyDatabase:
