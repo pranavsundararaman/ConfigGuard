@@ -4,16 +4,33 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+ENV/
+env/
 
 # Environment variables and secrets
 .env
 .env.*
 !.env.example
 
+# Credentials and private keys
+credentials/
+secrets/
+.aws/
+.ssh/
+credentials
+credentials.*
+*credentials*.json
+service-account*.json
+*.pem
+*.key
+*.p12
+
 # Database and generated files
 *.db
 *.sqlite3
 *.log
+dist/
+build/
 
 # Next.js (for V2)
 node_modules/
