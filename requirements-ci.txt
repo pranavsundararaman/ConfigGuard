@@ -1,0 +1,4 @@
+# Minimal dependencies for the runner-side parser and risk engine.
+pydantic>=2.0,<3
+PyYAML
+python-dotenv
