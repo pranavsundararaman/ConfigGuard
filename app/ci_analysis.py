@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import html
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ _UNSUPPORTED_CONFIG_SUFFIXES = {
     ".cfg", ".conf", ".config", ".envrc", ".hcl", ".ini", ".jsonc",
     ".properties", ".tf", ".tfvars", ".toml", ".xml",
 }
+_SENSITIVE_PATH_COMPONENT = re.compile(r"(?i)(api[-_]?key|password|token|secret|credential)")
 
 
 @dataclass(frozen=True)
@@ -66,12 +68,15 @@ def is_config_candidate(path: str) -> bool:
 
 
 def _git(repo: str, *args: str) -> bytes:
-    completed = subprocess.run(
-        ["git", "-C", repo, *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            ["git", "-C", repo, *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as error:
+        raise GitCommandError("Unable to run the requested Git comparison.") from error
     if completed.returncode:
         # Git diagnostics can include filenames or ref text. Keep them out of CI logs.
         raise GitCommandError("Unable to read the requested Git comparison.")
@@ -187,6 +192,18 @@ def _safe_cell(value: str) -> str:
     return html.escape(visible, quote=True).replace("`", "&#96;").replace("|", "&#124;")
 
 
+def _safe_path(path: str) -> str:
+    """Keep diagnostic path context while hiding components named like secrets."""
+    safe_parts = []
+    for part in PurePosixPath(path).parts:
+        if _SENSITIVE_PATH_COMPONENT.search(part):
+            suffix = PurePosixPath(part).suffix
+            safe_parts.append(f"[redacted-name]{suffix}")
+        else:
+            safe_parts.append(part)
+    return _safe_cell("/".join(safe_parts))
+
+
 def render_summary(results: list[FileAnalysis]) -> str:
     analyzed = sum(result.status == "analyzed" for result in results)
     unchanged = sum(result.status == "unchanged" for result in results)
@@ -222,7 +239,7 @@ def render_summary(results: list[FileAnalysis]) -> str:
         score = f"{item.risk_score:.2f}" if item.risk_score is not None else "-"
         label = item.message or ("Pairwise change-risk analysis" if item.status == "analyzed" else item.status.title())
         lines.append(
-            f"| `{_safe_cell(item.path)}` | {_safe_cell(label)} | {_safe_cell(item.classification)} | {score} | {item.change_count} |"
+            f"| `{_safe_path(item.path)}` | {_safe_cell(label)} | {_safe_cell(item.classification)} | {score} | {item.change_count} |"
         )
         for parameter, change_type, rule_names in item.rule_findings:
             rule_text = ", ".join(_safe_cell(name) for name in rule_names) if rule_names else "No rule-specific finding; magnitude-based change"
@@ -258,9 +275,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         run(args.base, args.head, args.repo)
-    except RuntimeError as error:
-        # Runtime errors are generic and sanitized by the helpers above.
+    except OSError:
+        # Summary destinations and OS diagnostics can contain runner-specific paths.
+        print("Unable to write the analysis summary.", file=sys.stderr)
+        return 2
+    except GitCommandError as error:
         print(str(error), file=sys.stderr)
+        return 2
+    except RuntimeError:
+        # Do not assume exceptions from future helpers are safe to print.
+        print("Unable to complete the configuration analysis.", file=sys.stderr)
         return 2
     return 0
 

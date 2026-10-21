@@ -185,6 +185,97 @@ def test_valid_config_summaries_redact_synthetic_secrets(git_repo, path, before,
     assert "envAfterSecret" not in summary
 
 
+@pytest.mark.parametrize(
+    ("path", "before", "after", "fake_values"),
+    [
+        (
+            "service.json",
+            '{"API_KEY":"json_fake_api_key_91","PASSWORD":"json_fake_password_82","TOKEN":"json_fake_token_73","SECRET":"json_fake_secret_64"}',
+            '{"API_KEY":"json_new_api_key_91","PASSWORD":"json_new_password_82","TOKEN":"json_new_token_73","SECRET":"json_new_secret_64"}',
+            ("json_fake_api_key_91", "json_fake_password_82", "json_fake_token_73", "json_fake_secret_64", "json_new_api_key_91", "json_new_password_82", "json_new_token_73", "json_new_secret_64"),
+        ),
+        (
+            "service.yaml",
+            "API_KEY: yaml_fake_api_key_91\nPASSWORD: yaml_fake_password_82\nTOKEN: yaml_fake_token_73\nSECRET: yaml_fake_secret_64\n",
+            "API_KEY: yaml_new_api_key_91\nPASSWORD: yaml_new_password_82\nTOKEN: yaml_new_token_73\nSECRET: yaml_new_secret_64\n",
+            ("yaml_fake_api_key_91", "yaml_fake_password_82", "yaml_fake_token_73", "yaml_fake_secret_64", "yaml_new_api_key_91", "yaml_new_password_82", "yaml_new_token_73", "yaml_new_secret_64"),
+        ),
+        (
+            ".env.staging",
+            "API_KEY=env_fake_api_key_91\nPASSWORD=env_fake_password_82\nTOKEN=env_fake_token_73\nSECRET=env_fake_secret_64\n",
+            "API_KEY=env_new_api_key_91\nPASSWORD=env_new_password_82\nTOKEN=env_new_token_73\nSECRET=env_new_secret_64\n",
+            ("env_fake_api_key_91", "env_fake_password_82", "env_fake_token_73", "env_fake_secret_64", "env_new_api_key_91", "env_new_password_82", "env_new_token_73", "env_new_secret_64"),
+        ),
+    ],
+)
+def test_sensitive_key_values_never_reach_summary_or_cli_output(git_repo, path, before, after, fake_values, capsys):
+    repo, base = git_repo
+    file_path = repo / path
+    file_path.write_text(before, encoding="utf-8")
+    base = _commit(repo, "add synthetic secret fixture")
+    file_path.write_text(after, encoding="utf-8")
+    head = _commit(repo, "change synthetic secret fixture")
+
+    results = run(base, head, str(repo))
+    summary = render_summary(results)
+    cli_output = capsys.readouterr().out
+
+    assert all(key in summary for key in ("API_KEY", "PASSWORD", "TOKEN", "SECRET"))
+    assert all(value not in summary and value not in cli_output for value in fake_values)
+
+
+@pytest.mark.parametrize("sensitive_label", ["API_KEY", "PASSWORD", "TOKEN", "SECRET"])
+def test_sensitive_filename_components_are_redacted_but_format_context_remains(sensitive_label):
+    fake_filename_value = f"{sensitive_label}_fake_path_value"
+    result = ci_analysis.FileAnalysis(
+        f"deploy/{fake_filename_value}.yaml",
+        "unavailable",
+        message="Could not analyze: invalid or unreadable configuration.",
+    )
+
+    summary = render_summary([result])
+
+    assert fake_filename_value not in summary
+    assert "fake_path_value" not in summary
+    assert "deploy/" in summary
+    assert "[redacted-name].yaml" in summary
+    assert "Could not analyze" in summary
+
+
+def test_summary_write_failure_is_generic_and_does_not_echo_destination(git_repo, monkeypatch, capsys):
+    repo, base = git_repo
+    (repo / "valid.json").write_text('{"ok": true}', encoding="utf-8")
+    head = _commit(repo)
+    fake_path = "runner_FAKE_SECRET_SUMMARY_PATH"
+
+    def fail_write(*args, **kwargs):
+        raise OSError(f"cannot write {fake_path}")
+
+    monkeypatch.setattr(ci_analysis, "write_summary", fail_write)
+    exit_code = main(["--base", base, "--head", head, "--repo", str(repo)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "Unable to write the analysis summary." in captured.err
+    assert fake_path not in captured.out + captured.err
+
+
+def test_unexpected_runtime_error_is_not_printed(git_repo, monkeypatch, capsys):
+    repo, _ = git_repo
+    fake_secret = "unexpected_FAKE_SECRET_ERROR"
+
+    def fail_comparison(*args, **kwargs):
+        raise RuntimeError(f"parser details include {fake_secret}")
+
+    monkeypatch.setattr(ci_analysis, "changed_config_paths", fail_comparison)
+    exit_code = main(["--base", "base", "--head", "head", "--repo", str(repo)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert fake_secret not in captured.out + captured.err
+    assert "Unable to complete the configuration analysis." in captured.err
+
+
 def test_unsupported_configuration_is_reported_without_analysis(git_repo):
     repo, base = git_repo
     (repo / "config.toml").write_text("timeout = 30\n", encoding="utf-8")
@@ -294,6 +385,32 @@ def test_git_comparison_failure_is_a_nonzero_cli_error(git_repo, tmp_path, monke
     captured = capsys.readouterr()
     assert "Unable to read the requested Git comparison." in captured.err
     assert "missing-base-ref" not in captured.err
+
+
+def test_git_stderr_and_spawn_errors_are_not_echoed(git_repo, tmp_path, monkeypatch, capsys):
+    repo, _ = git_repo
+    fake_secret = "git_FAKE_SECRET_DIAGNOSTIC"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
+
+    def fail_git(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 128, stdout=b"", stderr=f"fatal: {fake_secret}".encode())
+
+    monkeypatch.setattr(ci_analysis.subprocess, "run", fail_git)
+    exit_code = main(["--base", "base", "--head", "head", "--repo", str(repo)])
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert fake_secret not in captured.out + captured.err
+    assert "Unable to read the requested Git comparison." in captured.err
+
+    def fail_to_spawn(*args, **kwargs):
+        raise OSError(f"missing executable in path containing {fake_secret}")
+
+    monkeypatch.setattr(ci_analysis.subprocess, "run", fail_to_spawn)
+    exit_code = main(["--base", "base", "--head", "head", "--repo", str(repo)])
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert fake_secret not in captured.out + captured.err
+    assert "Unable to run the requested Git comparison." in captured.err
 
 
 def test_git_blob_read_failure_is_not_downgraded_to_an_advisory(git_repo, tmp_path, monkeypatch, capsys):
