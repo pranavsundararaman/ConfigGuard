@@ -109,3 +109,55 @@ Run tests:
 ```bash
 pytest
 ```
+
+## ConfigGuard V2.4 GitHub Actions (Milestone 1)
+
+The `ConfigGuard PR analysis` workflow runs the existing parser and pairwise
+risk engine directly inside the GitHub Actions runner. The `pull_request`
+workflow uses the event's `pull_request.base.sha` and `pull_request.head.sha`.
+Checkout uses `fetch-depth: 0`, so both commit objects and their merge base are
+available for the three-dot comparison, including newly opened and updated
+pull requests. It does not call the FastAPI service, MongoDB, or the
+historical-analysis endpoint. Supported files are JSON, YAML/YML, `.env`,
+`*.env`, and dotenv names such as `.env.production` and `.env.staging`. Common
+unsupported configuration suffixes are reported explicitly. ENV files use
+strict syntax validation in this workflow without changing the V1 or browser
+parser API behavior.
+
+Results are written to the GitHub Actions step summary. It reports analyzed,
+unchanged, unavailable, and unsupported file counts separately. A successful
+analysis with no rule findings says so explicitly; if nothing could be
+analyzed, the summary says that instead. File names, changed parameter names,
+classifications, risk scores, rule findings, and counts are shown; old/new
+values, source lines, and parser exception text are omitted. Parse errors,
+unsupported formats, and risk findings are advisory and do not fail the
+analysis step. Setup failures and Git comparison/blob-read failures fail the
+workflow. The workflow grants `contents: read` only and disables persisted
+checkout credentials.
+
+This is pairwise change-risk analysis of the base and pull request versions,
+not historical analysis. It can report semantic configuration changes and
+apply the existing magnitude and rule logic. It cannot assess deployed history,
+runtime environment, referenced secret values, cross-file interactions, or
+deployment success. Renames recognized by Git's similarity-based rename
+detection are analyzed as one before/after pair; changes Git classifies as a
+separate deletion and addition are assessed separately.
+
+`requirements-ci.txt` installs only the Python packages needed to parse files
+and run the shared analysis engine. From the repository root, the focused
+tests and equivalent local analysis can be run with:
+
+```powershell
+python -m pip install -r requirements-ci.txt
+python -m pytest tests/test_ci_analysis.py -q
+git fetch origin main
+$base = git merge-base origin/main HEAD
+$head = git rev-parse HEAD
+$env:GITHUB_STEP_SUMMARY = Join-Path $env:TEMP 'configguard-summary.md'
+python -m app.ci_analysis --base $base --head $head --repo .
+Get-Content $env:GITHUB_STEP_SUMMARY
+Remove-Item Env:GITHUB_STEP_SUMMARY
+```
+
+The CLI writes the same summary to standard output when `GITHUB_STEP_SUMMARY`
+is not set. To run the entire backend suite, use `python -m pytest -q`.

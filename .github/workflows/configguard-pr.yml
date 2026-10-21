@@ -1,0 +1,38 @@
+name: ConfigGuard PR analysis
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  config-analysis:
+    name: Advisory configuration analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out pull request
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install local analysis dependencies
+        run: python -m pip install -r requirements-ci.txt
+
+      - name: Analyze changed configuration files
+        env:
+          CONFIGGUARD_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CONFIGGUARD_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          python -m app.ci_analysis
+          --base "$CONFIGGUARD_BASE_SHA"
+          --head "$CONFIGGUARD_HEAD_SHA"
