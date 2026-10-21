@@ -153,3 +153,59 @@ def test_existing_v1_health_endpoint_is_unchanged():
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "service": "configguard"}
+
+
+def test_browser_config_parse_endpoint_uses_shared_env_parser():
+    response = client.post(
+        "/api/parse-config",
+        json={"format": "env", "content": "export ENABLED=true\nPORT=8080\n"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"configuration": {"ENABLED": True, "PORT": 8080}}
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"service": {"replicas": 3}}',
+        "service:\n  replicas: 3\n",
+        "NOT_AN_ASSIGNMENT\n",
+    ],
+)
+def test_browser_config_parse_endpoint_reports_non_env_or_malformed_input(content):
+    response = client.post(
+        "/api/parse-config",
+        json={"format": "env", "content": content},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]
+
+
+def test_historical_analysis_normalizes_matching_values_across_formats(fake_database):
+    versions = [
+        ({"service": {"timeout_seconds": 30}}, "json"),
+        ({"service": {"timeout_seconds": 30}}, "yaml"),
+        ({"SERVICE_TIMEOUT_SECONDS": 30}, "env"),
+    ]
+    version_ids = []
+    for configuration, format in versions:
+        version = client.post(
+            "/api/projects/payments/config-versions",
+            json={"configuration": configuration, "format": format},
+        ).json()
+        deployed = client.post(f"/api/projects/payments/config-versions/{version['id']}/deploy")
+        assert deployed.status_code == 200
+        version_ids.append(version["id"])
+
+    analysis = client.post(
+        "/api/projects/payments/historical-analysis",
+        json={"configuration": {"SERVICE_TIMEOUT_SECONDS": 31}, "format": "env"},
+    )
+
+    assert analysis.status_code == 201
+    finding = analysis.json()["results"][0]
+    assert finding["parameter"] == "service.timeout.seconds"
+    assert finding["observation_count"] == 3
+    assert set(analysis.json()["baseline_version_ids"]) == set(version_ids)

@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, AlertCircle, ArrowDownRight, ArrowUpRight, Check, CheckCircle2, ChevronRight, Clock3, Code2, FileClock, FilePlus2, FolderKanban, Gauge, History, Layers3, LoaderCircle, Play, RefreshCw, Search, Shield, ShieldAlert, ShieldCheck, TriangleAlert, X } from 'lucide-react'
 import { api, normalizeHistoricalResults, normalizeLimitations, normalizeStringList, type AnalysisRecord, type ConfigFormat, type ConfigVersion, type HistoricalResult } from './api'
+import { defaultConfigurationExample, planFormatSwitch, resolveFormatSwitch, type FormatSwitchChoice, type FormatSwitchPlan, parseConfiguration } from './configParser'
 import './App.css'
 
 type View = 'overview' | 'analyze' | 'configurations' | 'analyses'
@@ -10,8 +11,6 @@ const NAV: Array<{ id: View; title: string; icon: typeof Gauge }> = [
   { id: 'configurations', title: 'Configurations', icon: Layers3 },
   { id: 'analyses', title: 'Analyses', icon: History },
 ]
-const JSON_EXAMPLE = '{\n  "service": {\n    "replicas": 3,\n    "timeout_seconds": 30\n  },\n  "database": {\n    "pool_size": 12\n  }\n}'
-
 function formatDate(value?: string) {
   if (!value) return '—'
   const date = new Date(value)
@@ -19,8 +18,6 @@ function formatDate(value?: string) {
 }
 
 function asError(error: unknown) { return error instanceof Error ? error.message : 'Something went wrong. Please try again.' }
-function isObject(value: unknown): value is Record<string, unknown> { return value !== null && typeof value === 'object' && !Array.isArray(value) }
-
 function App() {
   const [view, setView] = useState<View>('analyze')
   const [projectId, setProjectId] = useState(() => localStorage.getItem('configguard-project') || 'configguard-demo')
@@ -31,7 +28,13 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [pageError, setPageError] = useState('')
   const [format, setFormat] = useState<ConfigFormat>('json')
-  const [configText, setConfigText] = useState(JSON_EXAMPLE)
+  const [configText, setConfigText] = useState(() => defaultConfigurationExample('json'))
+  const [formatSwitching, setFormatSwitching] = useState(false)
+  const [formatSwitchPlan, setFormatSwitchPlan] = useState<FormatSwitchPlan | null>(null)
+  const formatSwitchLock = useRef(false)
+  const formatSelectRef = useRef<HTMLSelectElement>(null)
+  const formatDialogRef = useRef<HTMLDivElement>(null)
+  const wasFormatDialogOpen = useRef(false)
   const [minObservations, setMinObservations] = useState('3')
   const [editorError, setEditorError] = useState('')
   const [analyzing, setAnalyzing] = useState(false)
@@ -73,14 +76,9 @@ function App() {
     setLatestAnalysis(null); setSelectedAnalysis(null); setPageError('')
   }
 
-  function parseEditor(nextText = configText, nextFormat = format) {
-    if (nextFormat !== 'json') {
-      setEditorError(`${nextFormat.toUpperCase()} parsing is not available in this browser build. Choose JSON to analyze or save a configuration. No request was sent.`)
-      return
-    }
+  async function parseEditor(nextText = configText, nextFormat = format) {
     try {
-      const value: unknown = JSON.parse(nextText)
-      if (!isObject(value)) throw new Error('The top level value must be a JSON object.')
+      const value = await parseConfiguration(nextText, nextFormat)
       setEditorError('')
       return value
     } catch (error) {
@@ -88,9 +86,61 @@ function App() {
     }
   }
 
+  useEffect(() => {
+    if (formatSwitchPlan) {
+      wasFormatDialogOpen.current = true
+      formatDialogRef.current?.querySelector<HTMLButtonElement>('[data-autofocus="true"]')?.focus()
+    } else if (wasFormatDialogOpen.current) {
+      wasFormatDialogOpen.current = false
+      formatSelectRef.current?.focus()
+    }
+  }, [formatSwitchPlan])
+
+  async function switchFormat(nextFormat: ConfigFormat) {
+    if (nextFormat === format || formatSwitchLock.current) return
+    formatSwitchLock.current = true
+    setFormatSwitching(true)
+    setEditorError('')
+    try {
+      const plan = await planFormatSwitch(configText, format, nextFormat)
+      if (plan.requiresChoice) setFormatSwitchPlan(plan)
+      else applyFormatSwitch(plan, 'convert')
+    } finally {
+      formatSwitchLock.current = false
+      setFormatSwitching(false)
+    }
+  }
+
+  function applyFormatSwitch(plan: FormatSwitchPlan, choice: FormatSwitchChoice) {
+    try {
+      const result = resolveFormatSwitch(plan, choice)
+      setFormat(result.format)
+      setConfigText(result.content)
+      setEditorError(choice === 'example' ? `Loaded a valid ${plan.targetFormat.toUpperCase()} example.` : '')
+      setFormatSwitchPlan(null)
+    } catch (error) {
+      setEditorError(asError(error))
+    }
+  }
+
+  function handleFormatDialogKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      if (formatSwitchPlan) applyFormatSwitch(formatSwitchPlan, 'cancel')
+      return
+    }
+    if (event.key !== 'Tab' || !formatDialogRef.current) return
+    const focusable = [...formatDialogRef.current.querySelectorAll<HTMLButtonElement>('button:not(:disabled)')]
+    if (!focusable.length) return
+    const first = focusable[0]
+    const last = focusable[focusable.length - 1]
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
+  }
+
   async function runAnalysis(event: React.FormEvent) {
     event.preventDefault()
-    const object = parseEditor()
+    const object = await parseEditor()
     const minimum = Number(minObservations)
     if (!object || !Number.isInteger(minimum) || minimum < 3 || minimum > 100) {
       if (object && (minimum < 3 || minimum > 100 || !Number.isInteger(minimum))) setEditorError('Minimum observations must be a whole number from 3 to 100.')
@@ -104,7 +154,7 @@ function App() {
   }
 
   async function saveVersion() {
-    const object = parseEditor()
+    const object = await parseEditor()
     if (!object) return
     setSavingVersion(true); setPageError('')
     try { await api.saveVersion(projectId, object, format); await refresh(); setView('configurations') }
@@ -139,7 +189,7 @@ function App() {
       <nav className="main-nav" aria-label="Main navigation">
         {NAV.map(({ id, title: label, icon: Icon }) => <button key={id} className={`nav-item ${view === id ? 'active' : ''}`} onClick={() => { setView(id); setPageError('') }}><Icon size={17} /><span>{label}</span>{id === 'configurations' && versions.length > 0 && <small>{versions.length}</small>}</button>)}
       </nav>
-      <div className="sidebar-bottom"><div className={`api-status ${health}`}><span className="status-dot" /><span>{health === 'checking' ? 'Checking API' : health === 'online' ? 'API reachable' : 'API unavailable'}</span><span className="api-service">{health === 'online' ? '●' : '○'}</span></div><div className="sidebar-foot">ConfigGuard V2.2 <span>·</span> Preview</div></div>
+      <div className="sidebar-bottom"><div className={`api-status ${health}`}><span className="status-dot" /><span>{health === 'checking' ? 'Checking API' : health === 'online' ? 'API reachable' : 'API unavailable'}</span><span className="api-service">{health === 'online' ? '●' : '○'}</span></div><div className="sidebar-foot">ConfigGuard V2.3 <span>·</span> Preview</div></div>
     </aside>
 
     <main className="main-panel">
@@ -151,12 +201,12 @@ function App() {
           <PageHeading eyebrow="RISK WORKBENCH" title="Analyze a configuration" description="Compare proposed parameter values with deployed history for this project." />
           <div className="analysis-layout"><form className="panel editor-panel" onSubmit={runAnalysis}>
             <div className="panel-heading"><div><h2>Configuration input</h2><p>Paste the proposed configuration content.</p></div><span className="step-badge"><Code2 size={15} /> INPUT</span></div>
-            <div className="editor-toolbar"><label htmlFor="format">FORMAT</label><select id="format" value={format} onChange={(event) => { const next = event.target.value as ConfigFormat; setFormat(next); setEditorError(next === 'json' ? '' : `${next.toUpperCase()} parsing is not available in this browser build. Choose JSON to analyze or save a configuration. No request was sent.`) }}><option value="json">JSON · supported</option><option value="yaml" disabled>YAML · unavailable</option><option value="yml" disabled>YML · unavailable</option><option value="env" disabled>.env · unavailable</option></select><span className="editor-hint">Object at root · UTF-8</span></div>
-            <label className="sr-only" htmlFor="config-editor">Configuration content</label><textarea id="config-editor" className="code-editor" spellCheck={false} value={configText} onChange={(event) => { setConfigText(event.target.value); setEditorError('') }} aria-describedby="format-note" />
-            <div id="format-note" className="format-note"><AlertCircle size={14} /> YAML and .env are parsed by the backend, but this UI currently sends structured JSON only.</div>
+            <div className="editor-toolbar"><label htmlFor="format">FORMAT</label><select ref={formatSelectRef} id="format" value={format} disabled={formatSwitching || Boolean(formatSwitchPlan)} onChange={(event) => { void switchFormat(event.target.value as ConfigFormat) }}><option value="json">JSON</option><option value="yaml">YAML</option><option value="yml">YML</option><option value="env">ENV</option></select><span className="editor-hint">UTF-8 · object/mapping at root</span></div>
+            <label className="sr-only" htmlFor="config-editor">Configuration content</label><textarea id="config-editor" className="code-editor" spellCheck={false} value={configText} disabled={formatSwitching || Boolean(formatSwitchPlan)} onChange={(event) => { setConfigText(event.target.value); setEditorError('') }} aria-describedby="format-note" />
+            <div id="format-note" className="format-note"><AlertCircle size={14} /> ENV uses underscore-separated paths; underscores are path separators by convention. ENV values are text and numeric/boolean values are normalized by the backend parser. Only numeric values are assessed by historical analysis.</div>
             <div className="editor-footer"><label className="minimum-setting">MIN. OBSERVATIONS <input type="number" min={3} max={100} step={1} value={minObservations} onChange={(event) => setMinObservations(event.target.value)} aria-label="Minimum historical observations" /></label><span className="muted tiny">At least 3 required by the API</span></div>
             {editorError && <div className="inline-error" role="alert"><AlertCircle size={15} />{editorError}</div>}
-            <div className="form-actions"><button type="button" className="button secondary" onClick={() => void saveVersion()} disabled={savingVersion || format !== 'json'}>{savingVersion ? <LoaderCircle className="spin" size={16} /> : <FilePlus2 size={16} />} Save as proposal</button><button type="submit" className="button primary" disabled={analyzing || format !== 'json'}>{analyzing ? <LoaderCircle className="spin" size={16} /> : <Play size={15} fill="currentColor" />} Run historical analysis</button></div>
+            <div className="form-actions"><button type="button" className="button secondary" onClick={() => void saveVersion()} disabled={savingVersion || formatSwitching || Boolean(formatSwitchPlan)}>{savingVersion ? <LoaderCircle className="spin" size={16} /> : <FilePlus2 size={16} />} Save as proposal</button><button type="submit" className="button primary" disabled={analyzing || formatSwitching || Boolean(formatSwitchPlan)}>{analyzing ? <LoaderCircle className="spin" size={16} /> : <Play size={15} fill="currentColor" />} Run historical analysis</button></div>
           </form>
             <aside className="panel guidance-panel"><div className="guidance-icon"><ShieldCheck size={20} /></div><h2>Historical analysis</h2><p>Compares numeric values against prior deployed versions in <strong>{projectId}</strong>.</p><div className="guidance-rule" /><div className="guidance-row"><span>Baseline source</span><strong>Deployed only</strong></div><div className="guidance-row"><span>Minimum sample</span><strong>{minObservations || 3} observations</strong></div><div className="guidance-row"><span>Proposal lifecycle</span><strong>Not auto-deployed</strong></div><div className="advisory-note"><TriangleAlert size={15} /><span>Unusual values suggest review. They do not predict deployment failure.</span></div></aside>
           </div>
@@ -173,6 +223,21 @@ function App() {
         </section>}
       </div>
     </main>
+    {formatSwitchPlan && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) applyFormatSwitch(formatSwitchPlan, 'cancel') }}>
+      <div ref={formatDialogRef} className="format-dialog" role="dialog" aria-modal="true" aria-labelledby="format-dialog-title" aria-describedby="format-dialog-description" onKeyDown={handleFormatDialogKeyDown}>
+        <div className="format-dialog-icon"><Code2 size={18} /></div>
+        <h2 id="format-dialog-title">Switch to {formatSwitchPlan.targetFormat.toUpperCase()}?</h2>
+        <p id="format-dialog-description">{formatSwitchPlan.sourceFormat === 'env'
+          ? 'ENV variable names are flat strings. Splitting underscores into nested path components is a deterministic convention, but it cannot reveal whether an underscore was part of a literal key. The converted hierarchy is inferred, not the original structure.'
+          : 'Choose how to handle the current editor content.'}</p>
+        {formatSwitchPlan.conversionError && <div className="format-dialog-error" role="status"><AlertCircle size={15} />{formatSwitchPlan.conversionError}</div>}
+        <div className="format-dialog-actions">
+          <button className="button primary" data-autofocus={formatSwitchPlan.convertedContent ? 'true' : undefined} disabled={!formatSwitchPlan.convertedContent} onClick={() => applyFormatSwitch(formatSwitchPlan, 'convert')}>Convert using convention</button>
+          <button className="button secondary" data-autofocus={!formatSwitchPlan.convertedContent ? 'true' : undefined} onClick={() => applyFormatSwitch(formatSwitchPlan, 'example')}>Use format example</button>
+          <button className="button quiet" onClick={() => applyFormatSwitch(formatSwitchPlan, 'cancel')}>Cancel</button>
+        </div>
+      </div>
+    </div>}
   </div>
 }
 

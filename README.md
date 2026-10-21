@@ -71,6 +71,7 @@ Mark an accepted deployment with
 `POST /api/projects/{project_id}/config-versions/{version_id}/deploy`.
 Retrieve project analyses with `GET /api/projects/{project_id}/analyses` or
 `GET /api/projects/{project_id}/analyses/{analysis_id}`.
+The frontend parser endpoint `POST /api/parse-config` accepts `{ "format": "env", "content": "KEY=value" }` and returns the normalized configuration object using the backend parser.
 Use `POST /api/projects/{project_id}/historical-analysis` with a proposed
 configuration and optional `min_observations` (default 3, allowed range 3–100)
 to compare numeric parameters with deployed versions in that project. The
@@ -78,6 +79,21 @@ proposal is saved but remains proposed, so it does not enter later baselines
 until explicitly marked deployed. Numeric outlier checks use the median and
 median absolute deviation; they are advisory review signals, not predictions of
 deployment failure.
+Across JSON/YAML and ENV, underscore-separated field components normalize to
+the same dotted historical parameter name (for example, nested `service.timeout_seconds`
+and `SERVICE_TIMEOUT_SECONDS` normalize to `service.timeout.seconds`). Colliding
+paths are rejected. Historical analysis assesses numeric scalar values; other
+types are reported as not assessed.
+
+The V2.3 browser editor converts structured paths to ENV by joining path
+components with underscores and uppercasing them. Converting ENV back splits
+every underscore into a path component and lowercases it; this is a deterministic
+inference, not recovery of the original nesting, because literal underscores in
+keys are ambiguous. Collisions such as `service_timeout.seconds` and
+`service.timeout_seconds` are rejected. ENV values are text; the parser
+normalizes numeric and boolean looking values to numbers and booleans, so such
+strings cannot be safely round-tripped as strings. JSON/YAML conversions retain
+numeric and boolean types.
 Missing samples are reported as insufficient history, and non-numeric values
 are explicitly left unassessed. Three is the minimum supported observation
 count, including for direct calls to the analysis function.

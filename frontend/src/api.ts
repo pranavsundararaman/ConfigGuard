@@ -105,6 +105,10 @@ const projectPath = (projectId: string) => `/api/projects/${encodeURIComponent(p
 
 export const api = {
   health: () => request<{ status: string; service: string }>('/api/health'),
+  parseConfig: (content: string, format: ConfigFormat) =>
+    request<{ configuration: Record<string, unknown> }>('/api/parse-config', {
+      method: 'POST', body: JSON.stringify({ content, format }),
+    }),
   versions: (projectId: string) => request<ConfigVersion[]>(`${projectPath(projectId)}/config-versions`),
   analyses: (projectId: string) => request<AnalysisRecord[]>(`${projectPath(projectId)}/analyses`),
   analysis: (projectId: string, id: string) => request<AnalysisRecord>(`${projectPath(projectId)}/analyses/${encodeURIComponent(id)}`),

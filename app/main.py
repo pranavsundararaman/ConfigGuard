@@ -4,10 +4,11 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
+import yaml
 
 from .database import MongoConfigurationError
 from .historical import MIN_HISTORICAL_OBSERVATIONS, analyze_historical_values
-from .parser import parse_config
+from .parser import normalize_historical_configuration, parse_config
 from .persistence import (
     get_analysis as fetch_project_analysis,
     get_configuration_version,
@@ -42,9 +43,24 @@ class HistoricalAnalysisRequest(BaseModel):
     min_observations: int = Field(default=MIN_HISTORICAL_OBSERVATIONS, ge=MIN_HISTORICAL_OBSERVATIONS, le=100)
 
 
+class ConfigurationParseRequest(BaseModel):
+    content: str
+    format: Literal["yaml", "yml", "json", "env"]
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "configguard"}
+
+
+@app.post("/api/parse-config")
+def parse_configuration(request: ConfigurationParseRequest):
+    """Parse browser-provided configuration text with the backend parsers."""
+    try:
+        configuration = parse_config(f"configuration.{request.format}", request.content, strict_env=request.format == "env")
+        return {"configuration": configuration}
+    except (ValueError, TypeError, yaml.YAMLError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/config-versions")
@@ -132,12 +148,19 @@ def create_historical_analysis(project_id: str, request: HistoricalAnalysisReque
     if not project_id.strip():
         raise HTTPException(status_code=400, detail="Project ID cannot be empty.")
     history = list_deployed_configuration_versions(project_id, limit=200)
-    prior_configurations = [item["configuration"] for item in history]
-    result = analyze_historical_values(
-        request.configuration,
-        prior_configurations,
-        min_observations=request.min_observations,
-    )
+    try:
+        proposed = normalize_historical_configuration(request.configuration, request.format)
+        prior_configurations = [
+            normalize_historical_configuration(item["configuration"], item.get("format", "json"))
+            for item in history
+        ]
+        result = analyze_historical_values(
+            proposed,
+            prior_configurations,
+            min_observations=request.min_observations,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     result.update({
         "project_id": project_id,
         "baseline_version_ids": [item["id"] for item in history],
