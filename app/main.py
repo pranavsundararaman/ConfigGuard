@@ -1,11 +1,18 @@
+import json
+import os
+import re
+import secrets
 from typing import Any, Literal
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
+from pydantic import ValidationError
 import yaml
 
+from .ci_models import CIAnalysisIngest, sanitize_ci_name
 from .database import MongoConfigurationError
 from .historical import MIN_HISTORICAL_OBSERVATIONS, analyze_historical_values
 from .parser import normalize_historical_configuration, parse_config
@@ -13,11 +20,14 @@ from .persistence import (
     get_analysis as fetch_project_analysis,
     get_configuration_version,
     list_analyses as list_project_analyses,
+    get_ci_analysis,
+    list_ci_analyses,
     list_deployed_configuration_versions,
     list_configuration_versions,
     mark_configuration_deployed,
     persist_analysis_bundle,
     save_configuration_version,
+    upsert_ci_analysis,
 )
 from .risk_engine import assess_risk
 
@@ -26,6 +36,10 @@ app = FastAPI(
     version="0.1.0",
     description="Configuration Change Risk Analysis for CI/CD Pipelines",
 )
+
+_CI_BODY_LIMIT = 64 * 1024
+_PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_ci_bearer = HTTPBearer(auto_error=False)
 
 
 @app.exception_handler(MongoConfigurationError)
@@ -61,6 +75,113 @@ def parse_configuration(request: ConfigurationParseRequest):
         return {"configuration": configuration}
     except (ValueError, TypeError, yaml.YAMLError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _check_ci_token(credentials: HTTPAuthorizationCredentials | None, setting: str) -> None:
+    expected = os.getenv(setting)
+    if not expected:
+        raise HTTPException(status_code=503, detail="CI integration is not configured.")
+    supplied = credentials.credentials if credentials and credentials.scheme.lower() == "bearer" else ""
+    if not secrets.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="CI integration authentication failed.")
+
+
+def _require_ci_ingest_token(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_ci_bearer),
+) -> None:
+    _check_ci_token(credentials, "CONFIGGUARD_CI_TOKEN")
+
+
+def _require_ci_read_token(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_ci_bearer),
+) -> None:
+    _check_ci_token(credentials, "CONFIGGUARD_CI_READ_TOKEN")
+
+
+async def _read_ci_payload(request: Request) -> CIAnalysisIngest:
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > _CI_BODY_LIMIT:
+            raise HTTPException(status_code=413, detail="CI analysis payload is too large.")
+    try:
+        raw = json.loads(body)
+        return CIAnalysisIngest.model_validate(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValidationError):
+        # Pydantic errors can include attacker-controlled values; return no input excerpts.
+        raise HTTPException(status_code=422, detail="Invalid CI analysis payload.") from None
+
+
+def _validate_ci_project(project_id: str) -> None:
+    if not _PROJECT_ID_PATTERN.fullmatch(project_id):
+        raise HTTPException(status_code=422, detail="Invalid project identifier.")
+
+
+@app.post(
+    "/api/projects/{project_id}/ci-analyses",
+    status_code=200,
+    description="Authenticated with `Authorization: Bearer <CONFIGGUARD_CI_TOKEN>`. Only sanitised metadata and findings are accepted.",
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": CIAnalysisIngest.model_json_schema()}},
+        }
+    },
+)
+async def ingest_ci_analysis(
+    project_id: str,
+    _: None = Depends(_require_ci_ingest_token),
+    payload: CIAnalysisIngest = Depends(_read_ci_payload),
+):
+    _validate_ci_project(project_id)
+    cleaned_payload = payload.model_dump(mode="json")
+    # Names are untrusted even after schema validation; normalize them again at storage.
+    for finding in cleaned_payload["findings"]:
+        finding["file_path"] = sanitize_ci_name(finding["file_path"], path=True)
+        finding["parameter"] = sanitize_ci_name(finding["parameter"])
+    try:
+        saved, created = upsert_ci_analysis(project_id, cleaned_payload)
+    except MongoConfigurationError:
+        raise
+    except Exception:
+        raise HTTPException(status_code=503, detail="CI analysis storage is unavailable.") from None
+    return {"analysis": saved, "created": created}
+
+
+@app.get(
+    "/api/projects/{project_id}/ci-analyses",
+    dependencies=[Depends(_require_ci_read_token)],
+    description="Requires `Authorization: Bearer <CONFIGGUARD_CI_READ_TOKEN>` and returns reports scoped to this project.",
+)
+def get_project_ci_analyses(
+    project_id: str,
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    _validate_ci_project(project_id)
+    try:
+        return list_ci_analyses(project_id, limit)
+    except MongoConfigurationError:
+        raise
+    except Exception:
+        raise HTTPException(status_code=503, detail="CI analysis storage is unavailable.") from None
+
+
+@app.get(
+    "/api/projects/{project_id}/ci-analyses/{analysis_id}",
+    dependencies=[Depends(_require_ci_read_token)],
+    description="Requires `Authorization: Bearer <CONFIGGUARD_CI_READ_TOKEN>` and returns a report scoped to this project.",
+)
+def get_project_ci_analysis(project_id: str, analysis_id: str):
+    _validate_ci_project(project_id)
+    try:
+        analysis = get_ci_analysis(project_id, analysis_id)
+    except MongoConfigurationError:
+        raise
+    except Exception:
+        raise HTTPException(status_code=503, detail="CI analysis storage is unavailable.") from None
+    if analysis is None:
+        raise HTTPException(status_code=404, detail="CI analysis not found.")
+    return analysis
 
 
 @app.get("/api/config-versions")

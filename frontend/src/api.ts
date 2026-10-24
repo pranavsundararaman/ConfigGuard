@@ -41,6 +41,44 @@ export interface AnalysisRecord {
   [key: string]: unknown
 }
 
+export interface CIAnalysisFinding {
+  file_path: string
+  parameter: string
+  change_type: 'ADDED' | 'REMOVED' | 'MODIFIED'
+  rule_names: string[]
+}
+
+export interface CIAnalysisRecord {
+  id: string
+  project_id: string
+  repository: string
+  pull_request_number: number
+  pull_request_url: string
+  base_sha: string
+  head_sha: string
+  risk_score: number
+  classification: 'SAFE' | 'REVIEW_REQUIRED' | 'HIGH_RISK'
+  findings: CIAnalysisFinding[]
+  change_counts: {
+    files_analyzed: number
+    files_unchanged: number
+    files_unavailable: number
+    files_unsupported: number
+    configuration_changes: number
+    rule_findings: number
+  }
+  created_at: string
+}
+
+export type CIHistoryDisplayState = 'connect' | 'loading' | 'error' | 'empty' | 'ready'
+
+export function getCIHistoryDisplayState(connected: boolean, loading: boolean, hasRecords: boolean, failed: boolean): CIHistoryDisplayState {
+  if (!connected) return 'connect'
+  if (failed) return 'error'
+  if (loading) return 'loading'
+  return hasRecords ? 'ready' : 'empty'
+}
+
 const HISTORICAL_STATUSES = [
   'not_assessed_non_numeric',
   'insufficient_history',
@@ -119,5 +157,13 @@ export const api = {
   analyze: (projectId: string, configuration: Record<string, unknown>, format: ConfigFormat, min_observations: number) =>
     request<AnalysisRecord>(`${projectPath(projectId)}/historical-analysis`, {
       method: 'POST', body: JSON.stringify({ configuration, format, min_observations }),
+    }),
+  ciAnalyses: (projectId: string, token: string) =>
+    request<CIAnalysisRecord[]>(`${projectPath(projectId)}/ci-analyses`, {
+      headers: { Authorization: `Bearer ${token}` },
+    }),
+  ciAnalysis: (projectId: string, id: string, token: string) =>
+    request<CIAnalysisRecord>(`${projectPath(projectId)}/ci-analyses/${encodeURIComponent(id)}`, {
+      headers: { Authorization: `Bearer ${token}` },
     }),
 }

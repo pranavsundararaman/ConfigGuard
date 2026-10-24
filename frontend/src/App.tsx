@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Activity, AlertCircle, ArrowDownRight, ArrowUpRight, Check, CheckCircle2, ChevronRight, Clock3, Code2, FileClock, FilePlus2, FolderKanban, Gauge, History, Layers3, LoaderCircle, Play, RefreshCw, Search, Shield, ShieldAlert, ShieldCheck, TriangleAlert, X } from 'lucide-react'
-import { api, normalizeHistoricalResults, normalizeLimitations, normalizeStringList, type AnalysisRecord, type ConfigFormat, type ConfigVersion, type HistoricalResult } from './api'
+import { Activity, AlertCircle, ArrowDownRight, ArrowUpRight, Check, CheckCircle2, ChevronRight, Clock3, Code2, FileClock, FilePlus2, FolderKanban, Gauge, GitPullRequest, History, Layers3, LoaderCircle, Play, RefreshCw, Search, Shield, ShieldAlert, ShieldCheck, TriangleAlert, X } from 'lucide-react'
+import { api, getCIHistoryDisplayState, normalizeHistoricalResults, normalizeLimitations, normalizeStringList, type AnalysisRecord, type CIAnalysisRecord, type ConfigFormat, type ConfigVersion, type HistoricalResult } from './api'
 import { defaultConfigurationExample, planFormatSwitch, resolveFormatSwitch, type FormatSwitchChoice, type FormatSwitchPlan, parseConfiguration } from './configParser'
 import './App.css'
 
-type View = 'overview' | 'analyze' | 'configurations' | 'analyses'
+type View = 'overview' | 'analyze' | 'configurations' | 'analyses' | 'ci-analyses'
 const NAV: Array<{ id: View; title: string; icon: typeof Gauge }> = [
   { id: 'overview', title: 'Overview', icon: Gauge },
   { id: 'analyze', title: 'Analyze config', icon: Activity },
   { id: 'configurations', title: 'Configurations', icon: Layers3 },
   { id: 'analyses', title: 'Analyses', icon: History },
+  { id: 'ci-analyses', title: 'GitHub PR checks', icon: GitPullRequest },
 ]
 function formatDate(value?: string) {
   if (!value) return '—'
@@ -25,6 +26,11 @@ function App() {
   const [health, setHealth] = useState<'checking' | 'online' | 'offline'>('checking')
   const [versions, setVersions] = useState<ConfigVersion[]>([])
   const [analyses, setAnalyses] = useState<AnalysisRecord[]>([])
+  const [ciAnalyses, setCiAnalyses] = useState<CIAnalysisRecord[]>([])
+  const [ciToken, setCiToken] = useState('')
+  const [ciTokenDraft, setCiTokenDraft] = useState('')
+  const [selectedCiAnalysis, setSelectedCiAnalysis] = useState<CIAnalysisRecord | null>(null)
+  const [ciHistoryStatus, setCiHistoryStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
   const [loading, setLoading] = useState(false)
   const [pageError, setPageError] = useState('')
   const [format, setFormat] = useState<ConfigFormat>('json')
@@ -47,13 +53,24 @@ function App() {
   const refresh = useCallback(async () => {
     if (!projectId.trim()) return
     setLoading(true); setPageError('')
-    const results = await Promise.allSettled([api.versions(projectId), api.analyses(projectId)])
-    if (results[0].status === 'fulfilled') setVersions(results[0].value)
-    if (results[1].status === 'fulfilled') setAnalyses(results[1].value)
-    const failure = results.find((result) => result.status === 'rejected')
+    setCiHistoryStatus(ciToken ? 'loading' : 'idle')
+    const [versionsResult, analysesResult, ciResult] = await Promise.allSettled([
+      api.versions(projectId),
+      api.analyses(projectId),
+      ciToken ? api.ciAnalyses(projectId, ciToken) : Promise.resolve(null),
+    ])
+    if (versionsResult.status === 'fulfilled') setVersions(versionsResult.value)
+    if (analysesResult.status === 'fulfilled') setAnalyses(analysesResult.value)
+    if (!ciToken) setCiAnalyses([])
+    else if (ciResult.status === 'fulfilled' && ciResult.value) {
+      setCiAnalyses(ciResult.value); setCiHistoryStatus('ready')
+    } else {
+      setCiAnalyses([]); setCiHistoryStatus('error')
+    }
+    const failure = [versionsResult, analysesResult, ciResult].find((result) => result.status === 'rejected')
     if (failure?.status === 'rejected') setPageError(asError(failure.reason))
     setLoading(false)
-  }, [projectId])
+  }, [ciToken, projectId])
 
   useEffect(() => {
     let active = true
@@ -73,7 +90,7 @@ function App() {
     const next = projectDraft.trim()
     if (!next) return
     setProjectId(next); localStorage.setItem('configguard-project', next)
-    setLatestAnalysis(null); setSelectedAnalysis(null); setPageError('')
+    setLatestAnalysis(null); setSelectedAnalysis(null); setSelectedCiAnalysis(null); setCiAnalyses([]); setPageError('')
   }
 
   async function parseEditor(nextText = configText, nextFormat = format) {
@@ -173,7 +190,15 @@ function App() {
     try { setSelectedAnalysis(await api.analysis(projectId, analysis.id)) } catch (error) { setPageError(asError(error)) }
   }
 
+  async function openCiAnalysis(analysis: CIAnalysisRecord) {
+    setSelectedCiAnalysis(analysis)
+    if (!ciToken) return
+    try { setSelectedCiAnalysis(await api.ciAnalysis(projectId, analysis.id, ciToken)) }
+    catch (error) { setPageError(asError(error)) }
+  }
+
   const filteredVersions = versions.filter((item) => `${item.id} ${item.format} ${item.lifecycle}`.toLowerCase().includes(filter.toLowerCase()))
+  const ciDisplayState = getCIHistoryDisplayState(Boolean(ciToken), ciHistoryStatus === 'loading' || loading, ciAnalyses.length > 0, ciHistoryStatus === 'error')
   const title = NAV.find((item) => item.id === view)?.title ?? 'Overview'
 
   return <div className="app-shell">
@@ -189,7 +214,7 @@ function App() {
       <nav className="main-nav" aria-label="Main navigation">
         {NAV.map(({ id, title: label, icon: Icon }) => <button key={id} className={`nav-item ${view === id ? 'active' : ''}`} onClick={() => { setView(id); setPageError('') }}><Icon size={17} /><span>{label}</span>{id === 'configurations' && versions.length > 0 && <small>{versions.length}</small>}</button>)}
       </nav>
-      <div className="sidebar-bottom"><div className={`api-status ${health}`}><span className="status-dot" /><span>{health === 'checking' ? 'Checking API' : health === 'online' ? 'API reachable' : 'API unavailable'}</span><span className="api-service">{health === 'online' ? '●' : '○'}</span></div><div className="sidebar-foot">ConfigGuard V2.3 <span>·</span> Preview</div></div>
+      <div className="sidebar-bottom"><div className={`api-status ${health}`}><span className="status-dot" /><span>{health === 'checking' ? 'Checking API' : health === 'online' ? 'API reachable' : 'API unavailable'}</span><span className="api-service">{health === 'online' ? '●' : '○'}</span></div><div className="sidebar-foot">ConfigGuard V2.5 <span>·</span> Preview</div></div>
     </aside>
 
     <main className="main-panel">
@@ -220,6 +245,17 @@ function App() {
         {view === 'analyses' && <section className="page-section"><PageHeading eyebrow="RISK HISTORY" title="Analyses" description="Review historical checks and their parameter-level findings." action={<button className="button primary" onClick={() => setView('analyze')}><Activity size={16} /> Run analysis</button>} />
           {analyses.length ? <div className="analysis-history">{analyses.map((analysis) => <button key={analysis.id} className={`history-row ${selectedAnalysis?.id === analysis.id ? 'selected' : ''}`} onClick={() => void openAnalysis(analysis)}><span className="history-symbol"><FileClock size={17} /></span><span className="history-main"><strong>{analysis.method || 'Historical analysis'}</strong><small>{normalizeHistoricalResults(analysis.results).length} parameters checked · {normalizeStringList(analysis.baseline_version_ids).length} deployed baseline versions</small></span><span className="history-date">{formatDate(analysis.created_at)}</span><ChevronRight size={16} className="history-chevron" /></button>)}</div> : <EmptyState icon={<History size={21} />} title={loading ? 'Loading analyses…' : 'No analyses yet'} description={loading ? 'Fetching saved project analyses.' : 'Run a historical analysis to create the first record.'} action={!loading && <button className="button secondary" onClick={() => setView('analyze')}>Analyze a configuration</button>} />}
           {selectedAnalysis && <AnalysisResult analysis={selectedAnalysis} onOpenHistory={() => setSelectedAnalysis(null)} />}
+        </section>}
+        {view === 'ci-analyses' && <section className="page-section"><PageHeading eyebrow="GITHUB ACTIONS" title="Pull request analyses" description="Review sanitised, advisory CI reports associated with this project." />
+          <form className="panel ci-access-panel" onSubmit={(event) => { event.preventDefault(); setPageError(''); setSelectedCiAnalysis(null); setCiToken(ciTokenDraft.trim()) }}>
+            <label htmlFor="ci-access-token">CI dashboard read token</label>
+            <input id="ci-access-token" type="password" autoComplete="off" value={ciTokenDraft} onChange={(event) => setCiTokenDraft(event.target.value)} placeholder="Enter CONFIGGUARD_CI_READ_TOKEN" />
+            <button className="button secondary" type="submit">Connect</button>
+            <small>The token stays in memory for this page session and is sent only to this ConfigGuard API.</small>
+            {ciToken && <button className="quiet-action ci-forget" type="button" onClick={() => { setCiToken(''); setCiTokenDraft(''); setCiAnalyses([]); setSelectedCiAnalysis(null); setCiHistoryStatus('idle'); setPageError('') }}>Forget token</button>}
+          </form>
+          {ciDisplayState === 'connect' ? <EmptyState icon={<GitPullRequest size={21} />} title="Connect to view CI history" description="Enter the backend CI integration token to load project-scoped pull request reports." /> : ciDisplayState === 'error' ? <EmptyState icon={<AlertCircle size={21} />} title="Could not load CI history" description="Check the token and confirm the backend CI integration is configured." /> : ciDisplayState === 'ready' ? <div className="analysis-history">{ciAnalyses.map((analysis) => <button key={analysis.id} className={`history-row ${selectedCiAnalysis?.id === analysis.id ? 'selected' : ''}`} onClick={() => void openCiAnalysis(analysis)}><span className="history-symbol"><GitPullRequest size={17} /></span><span className="history-main"><strong>{analysis.repository} #{analysis.pull_request_number} · {analysis.classification.replaceAll('_', ' ')}</strong><small>Score {analysis.risk_score.toFixed(2)} · {analysis.change_counts.configuration_changes} changes · {analysis.findings.length} findings</small></span><span className="history-date">{formatDate(analysis.created_at)}</span><ChevronRight size={16} className="history-chevron" /></button>)}</div> : <EmptyState icon={<GitPullRequest size={21} />} title={ciDisplayState === 'loading' ? 'Loading pull request history…' : 'No CI analyses yet'} description={ciDisplayState === 'loading' ? 'Fetching authenticated project reports.' : 'No GitHub Actions reports have been ingested for this project.'} />}
+          {selectedCiAnalysis && <CIAnalysisDetail analysis={selectedCiAnalysis} />}
         </section>}
       </div>
     </main>
@@ -280,6 +316,18 @@ function AnalysisResult({ analysis, onOpenHistory }: { analysis: AnalysisRecord;
     {results.length ? <div className="results-table-wrap"><table className="results-table"><thead><tr><th>PARAMETER</th><th>PROPOSED</th><th>OBSERVATIONS</th><th>BASELINE</th><th>ASSESSMENT</th></tr></thead><tbody>{results.map((item) => <tr key={item.parameter}><td className="parameter-name">{item.parameter}</td><td className="value-cell"><code>{String(item.proposed_value)}</code></td><td>{item.observation_count}{item.required_observations ? <span className="muted"> / {item.required_observations} min</span> : ''}</td><td className="baseline-cell">{item.baseline_median !== undefined ? <>Median <code>{item.baseline_median}</code><br />MAD <code>{item.baseline_mad ?? '—'}</code></> : <span className="muted">—</span>}</td><td><ResultStatus status={item.status} /><small className="explanation">{item.explanation}</small></td></tr>)}</tbody></table></div> : <div className="no-results">No numeric configuration parameters were available to assess.</div>}
     <div className="result-footer"><span><CheckCircle2 size={15} /> Analysis saved · {baselineVersionIds.length} deployed versions in baseline</span><button className="quiet-action" onClick={onOpenHistory}>Close details <ChevronRight size={14} /></button></div>
     <div className="analysis-identifiers"><span>ANALYSIS <code>{analysis.id}</code></span><span>PROPOSAL <code>{proposedVersionId}</code></span><span>BASELINE VERSIONS <code>{baselineVersionIds.join(', ') || 'None'}</code></span></div>
+  </section>
+}
+
+function CIAnalysisDetail({ analysis }: { analysis: CIAnalysisRecord }) {
+  const counts = analysis.change_counts
+  return <section className="panel ci-detail-panel">
+    <div className="ci-detail-header"><div><div className="eyebrow">PULL REQUEST #{analysis.pull_request_number}</div><h2>{analysis.repository}</h2><p>{analysis.classification.replaceAll('_', ' ')} · score {analysis.risk_score.toFixed(2)}</p></div><a className="button secondary" href={analysis.pull_request_url} target="_blank" rel="noreferrer noopener">Open pull request <ArrowUpRight size={14} /></a></div>
+    <dl className="ci-commit-grid"><div><dt>Base commit</dt><dd>{analysis.base_sha.slice(0, 12)}</dd></div><div><dt>Head commit</dt><dd>{analysis.head_sha.slice(0, 12)}</dd></div><div><dt>Analyzed</dt><dd>{formatDate(analysis.created_at)}</dd></div></dl>
+    <div className="ci-counts" aria-label="Aggregate change counts"><span>{counts.files_analyzed} analyzed</span><span>{counts.files_unchanged} unchanged</span><span>{counts.files_unavailable} unavailable</span><span>{counts.files_unsupported} unsupported</span><span>{counts.configuration_changes} changes</span><span>{counts.rule_findings} rule findings</span></div>
+    <div className="ci-findings-heading"><h3>Sanitised findings</h3><span>{analysis.findings.length} listed</span></div>
+    {analysis.findings.length ? <div className="table-wrap"><table><thead><tr><th>FILE</th><th>PARAMETER</th><th>CHANGE</th><th>RULES</th></tr></thead><tbody>{analysis.findings.map((finding, index) => <tr key={`${finding.file_path}-${finding.parameter}-${index}`}><td>{finding.file_path}</td><td>{finding.parameter}</td><td>{finding.change_type}</td><td>{finding.rule_names.join(', ') || 'Magnitude-based change'}</td></tr>)}</tbody></table></div> : <div className="no-results">This report contains no parameter-level findings.</div>}
+    <p className="ci-advisory">Advisory pairwise change-risk result. It uses no historical baseline and does not predict deployment failure.</p>
   </section>
 }
 
