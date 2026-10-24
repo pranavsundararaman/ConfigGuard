@@ -57,14 +57,19 @@ class FakeCollection:
         query = query or {}
         return FakeCursor([doc.copy() for doc in self.documents if _matches(doc, query)])
 
-    def find_one(self, query):
-        return next((doc.copy() for doc in self.documents if _matches(doc, query)), None)
+    def find_one(self, query, projection=None):
+        document = next((doc.copy() for doc in self.documents if _matches(doc, query)), None)
+        if document is not None and projection:
+            for field, enabled in projection.items():
+                if not enabled:
+                    document.pop(field, None)
+        return document
 
     def update_one(self, query, update, upsert=False):
         document = next((doc for doc in self.documents if _matches(doc, query)), None)
         if document is None:
             if upsert:
-                stored = {**query, **update.get("$setOnInsert", {}), "_id": ObjectId()}
+                stored = {**query, **update.get("$setOnInsert", {}), **update.get("$set", {}), "_id": ObjectId()}
                 self.documents.append(stored)
                 return type("UpdateResult", (), {"matched_count": 0, "upserted_id": stored["_id"]})()
             return type("UpdateResult", (), {"matched_count": 0, "upserted_id": None})()
@@ -238,3 +243,19 @@ def test_application_import_does_not_require_mongodb_uri():
     )
 
     assert completed.returncode == 0, "app.main should import without database configuration"
+
+
+def test_server_sessions_store_only_hashes_and_can_be_revoked(monkeypatch):
+    fake_db = FakeDatabase()
+    monkeypatch.setattr(persistence, "get_database", lambda: fake_db)
+
+    session_id, csrf_token = persistence.create_auth_session("synthetic-user-id", "synthetic-csrf")
+    stored = fake_db["auth_sessions"].documents[0]
+
+    assert session_id not in str(stored)
+    assert csrf_token == stored["csrf_token"]
+    assert stored["user_id"] == "synthetic-user-id"
+    assert persistence.get_auth_session(session_id)["user_id"] == "synthetic-user-id"
+
+    persistence.delete_auth_session(session_id)
+    assert persistence.get_auth_session(session_id) is None

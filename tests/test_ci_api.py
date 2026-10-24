@@ -2,6 +2,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main, persistence
+from app.session import SignedSessionMiddleware
+from bson import ObjectId
 from tests.test_persistence import FakeDatabase
 
 
@@ -15,8 +17,16 @@ def ci_client(monkeypatch):
     database = FakeDatabase()
     monkeypatch.setattr(persistence, "get_database", lambda: database)
     monkeypatch.setenv("CONFIGGUARD_CI_TOKEN", TOKEN)
-    monkeypatch.setenv("CONFIGGUARD_CI_READ_TOKEN", READ_TOKEN)
-    return database
+    user_id = ObjectId()
+    database["users"].documents.append({"_id": user_id, "github_id": 42, "github_login": "synthetic-user", "public_repositories": []})
+    for project_id in ("payments", "alpha", "beta"):
+        database["projects"].documents.append({"_id": project_id, "owner_user_id": str(user_id), "repository": "owner/service"})
+    secret = main.app.user_middleware[0].kwargs["secret_key"]
+    signer = SignedSessionMiddleware(None, secret)
+    session_id, _ = persistence.create_auth_session(str(user_id), "synthetic-csrf-token")
+    client.cookies.set("configguard_session", signer._encode({"session_id": session_id}))
+    yield database
+    client.cookies.clear()
 
 
 def report(**overrides):
@@ -83,13 +93,10 @@ def test_ci_ingestion_and_reads_reject_missing_or_invalid_tokens(ci_client, monk
     assert missing.status_code == invalid.status_code == 401
     assert missing.json() == invalid.json() == {"detail": "CI integration authentication failed."}
 
+    client.cookies.clear()
     read_with_ingest_token = client.get("/api/projects/payments/ci-analyses", headers=auth_headers())
-    assert read_with_ingest_token.status_code == 401
-
-    monkeypatch.delenv("CONFIGGUARD_CI_READ_TOKEN")
-    unavailable = client.get("/api/projects/payments/ci-analyses", headers=read_headers())
-    assert unavailable.status_code == 503
-    assert unavailable.json() == {"detail": "CI integration is not configured."}
+    read_with_legacy_token = client.get("/api/projects/payments/ci-analyses", headers=read_headers())
+    assert read_with_ingest_token.status_code == read_with_legacy_token.status_code == 401
 
 
 @pytest.mark.parametrize(
@@ -137,6 +144,17 @@ def test_ci_storage_errors_are_generic_and_do_not_echo_database_details(ci_clien
     assert fake_database_detail not in response.text
 
 
+def test_ci_ingestion_must_match_a_selected_repository_project(ci_client):
+    payload = report(
+        repository="other/service",
+        pull_request_url="https://github.com/other/service/pull/27",
+    )
+    response = client.post("/api/projects/payments/ci-analyses", json=payload, headers=auth_headers())
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Project and repository association not found."}
+    assert ci_client["ci_analyses"].documents == []
+
+
 def test_ci_history_reads_are_authenticated_and_project_scoped(ci_client):
     record = client.post("/api/projects/alpha/ci-analyses", json=report(), headers=auth_headers()).json()["analysis"]
 
@@ -150,6 +168,7 @@ def test_ci_history_reads_are_authenticated_and_project_scoped(ci_client):
     assert detail.json()["repository"] == "owner/service"
     assert other_project_list.json() == []
     assert other_project_detail.status_code == 404
+    client.cookies.clear()
     assert client.get("/api/projects/alpha/ci-analyses").status_code == 401
 
 

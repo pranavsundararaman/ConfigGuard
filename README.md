@@ -40,7 +40,9 @@ is optional and defaults to `configguard`. The application can be imported and
 unit tested without `MONGODB_URI`; the first database-backed operation returns a
 configuration error if it is missing. Each successful `/api/analyze` request
 stores its old snapshot as deployed, its new snapshot as proposed, and the risk
-result under the `default` project. The analysis references both versions.
+result under the authenticated user's selected repository project. The analysis
+references both versions. User data routes require a GitHub session; browser
+writes also require the session's CSRF token.
 
 Retrieval endpoints:
 
@@ -51,6 +53,13 @@ Retrieval endpoints:
 
 List limits can range from 1 to 200. Stored MongoDB ObjectIds are returned as
 string `id` fields.
+
+The legacy `/api/config-versions` and `/api/analyses` endpoints also require a
+GitHub session and the requested project must belong to that signed-in user.
+The V1 `/api/analyze` upload endpoint preserves its response shape but now
+requires a signed-in session, CSRF header, and an active selected project.
+`/api/health` and `/api/parse-config` remain public; the parser endpoint does
+not persist data.
 
 ## ConfigGuard V2.1 project history
 
@@ -169,12 +178,10 @@ backend. This remains a local/manual integration: the V2.4 pull-request
 workflow still writes only its Actions step summary and does not send reports
 to an API or require a public backend URL.
 
-Set `CONFIGGUARD_CI_TOKEN` and `CONFIGGUARD_CI_READ_TOKEN` in the backend's
-ignored local `.env` file. The write token is reserved for report ingestion;
-enter the separate read token in the dashboard's **GitHub PR checks** page to
-load history. The frontend keeps the read token in page memory only. If the
-relevant setting is absent, its routes return a generic configuration error.
-Tokens are compared as bearer credentials and are never included in responses.
+Set `CONFIGGUARD_CI_TOKEN` in the backend's ignored local `.env` file for
+machine report ingestion. V2.6 replaces the dashboard's shared read token with
+GitHub user sessions. `CONFIGGUARD_CI_READ_TOKEN` is no longer accepted by
+user-facing read routes.
 
 Authenticated endpoints:
 
@@ -182,7 +189,7 @@ Authenticated endpoints:
 - `GET /api/projects/{project_id}/ci-analyses?limit=50` lists reports.
 - `GET /api/projects/{project_id}/ci-analyses/{analysis_id}` retrieves one report.
 
-Project IDs are validated slugs and every read is project-scoped. Repository
+Project IDs are generated per-user IDs and every user read is owner-scoped. Repository
 names and pull-request URLs must identify the same `owner/repository` and PR on
 `https://github.com`. The backend bounds the JSON body and all lists/strings,
 accepts only risk classifications and known rule names, and rejects unknown
@@ -194,11 +201,49 @@ Configuration contents, old/new values, parser errors, source excerpts, and
 free-form finding text are not accepted. Sensitive-labelled path components
 and parameter names are replaced before persistence.
 
-To test locally, set the token in `.env`, run the backend, and enter that token
-in the dashboard's **GitHub PR checks** page. A request body should contain
+To test ingestion locally, set the machine token in `.env` and call the POST
+route with a selected project's ID. The dashboard's **GitHub PR checks** page
+loads reports through the authenticated user session. A request body should contain
 only the documented metadata, `findings` with `file_path`, `parameter`,
 `change_type`, and whitelisted `rule_names`, plus the six integer fields in
 `change_counts`; it must not contain configuration values. CI history is
 stored separately from historical configuration analyses. No workflow-side
 submission is enabled until the backend has a reachable HTTPS deployment and
 an explicit workflow configuration is reviewed.
+
+## ConfigGuard V2.6 GitHub sign-in and repository ownership
+
+Copy `.env.example` to `.env`, fill in MongoDB and GitHub OAuth App settings,
+and generate a unique `CONFIGGUARD_SESSION_SECRET`. In the GitHub OAuth App,
+set the callback URL to the exact value of `GITHUB_REDIRECT_URI`; for local
+development the example is `http://localhost:8000/api/auth/github/callback`.
+The app requests `read:user` and lists public repositories only. See GitHub's
+[OAuth scope reference](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps)
+and [OAuth App permissions comparison](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/differences-between-github-apps-and-oauth-apps).
+GitHub OAuth
+Apps do not provide narrow read-only access to private repositories: the
+classic `repo` scope grants broad private-repository read/write permissions.
+Private repository support should use a GitHub App with granular read-only
+permissions in a later phase.
+
+The browser signs in at `/api/auth/github/login`. The backend uses a signed,
+eight-hour, HttpOnly, SameSite=Lax session cookie; production mode sets Secure.
+Authlib validates OAuth state and uses PKCE S256 for the authorization code flow.
+After sign-in, the cookie contains a signed random session ID and active project
+ID; a hashed server-side session record stores the user and CSRF token and
+supports revocation on sign-out. During OAuth, Authlib's signed temporary state
+is also in the cookie. No GitHub access token is stored in the cookie or
+database. The token is used only in the callback to retrieve the user's profile
+and public repository list, then discarded. Unsafe browser requests require a session CSRF token. Select a
+repository from the dashboard to create an owner-scoped ConfigGuard project.
+Every project history and CI report read verifies project ownership on each
+request. CI ingestion continues to use `CONFIGGUARD_CI_TOKEN`, and accepts
+reports only when both the selected project and repository match.
+
+The OAuth implementation uses [Authlib's Starlette client](https://docs.authlib.org/en/latest/oauth2/client/web/)
+and the flow follows GitHub's [OAuth authorization guidance](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps).
+
+Existing records without a verified owner remain unavailable through the new
+dashboard APIs. They are not automatically assigned to the first user who
+signs in. The V2.4 workflow remains local and advisory; it does not submit to a
+hosted backend.

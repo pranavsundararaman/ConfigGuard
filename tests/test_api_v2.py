@@ -2,6 +2,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main, persistence
+from app.session import SignedSessionMiddleware
+from bson import ObjectId
 from tests.test_persistence import FakeDatabase
 
 
@@ -12,7 +14,19 @@ client = TestClient(main.app, raise_server_exceptions=False)
 def fake_database(monkeypatch):
     database = FakeDatabase()
     monkeypatch.setattr(persistence, "get_database", lambda: database)
-    return database
+    user_id = ObjectId()
+    database["users"].documents.append({"_id": user_id, "github_id": 42, "github_login": "synthetic-user", "public_repositories": []})
+    for project_id in ("payments", "alpha", "beta", "default", "search"):
+        database["projects"].documents.append({"_id": project_id, "owner_user_id": str(user_id), "repository": "owner/service"})
+    secret = main.app.user_middleware[0].kwargs["secret_key"]
+    signer = SignedSessionMiddleware(None, secret)
+    csrf = "synthetic-csrf-token"
+    session_id, _ = persistence.create_auth_session(str(user_id), csrf)
+    client.cookies.set("configguard_session", signer._encode({"session_id": session_id, "active_project_id": "default"}))
+    client.headers["X-CSRF-Token"] = csrf
+    yield database
+    client.cookies.clear()
+    client.headers.pop("X-CSRF-Token", None)
 
 
 def test_configuration_save_then_retrieve_workflow(fake_database):
@@ -133,7 +147,7 @@ def test_historical_minimum_is_validated_at_api_boundary(fake_database):
     assert response.status_code == 422
 
 
-def test_database_backed_endpoint_reports_missing_configuration(monkeypatch):
+def test_database_backed_endpoint_reports_missing_configuration(fake_database, monkeypatch):
     from app import database
 
     monkeypatch.setattr(database, "_database", None)

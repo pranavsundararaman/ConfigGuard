@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
+import secrets
 from threading import RLock
 from typing import Any
 from uuid import uuid4
@@ -20,6 +22,12 @@ class PersistenceWriteError(RuntimeError):
 def _serialize(document: dict[str, Any]) -> dict[str, Any]:
     document["id"] = str(document.pop("_id"))
     return jsonable_encoder(document)
+
+
+def _serialize_ci(document: dict[str, Any]) -> dict[str, Any]:
+    result = _serialize(document)
+    result.pop("owner_user_id", None)
+    return result
 
 
 def _version_document(project_id: str, item: dict[str, Any]) -> dict[str, Any]:
@@ -278,7 +286,7 @@ def get_analysis(project_id: str, analysis_id: str) -> dict[str, Any] | None:
         return _serialize(document) if document else None
 
 
-def upsert_ci_analysis(project_id: str, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+def upsert_ci_analysis(project_id: str, payload: dict[str, Any], owner_user_id: str | None = None) -> tuple[dict[str, Any], bool]:
     """Persist one sanitised CI report, deduplicating retries by PR head SHA."""
     database = get_database()
     collection = database["ci_analyses"]
@@ -296,6 +304,8 @@ def upsert_ci_analysis(project_id: str, payload: dict[str, Any]) -> tuple[dict[s
         "head_sha": payload["head_sha"],
     }
     document = {**payload, **query, "created_at": datetime.now(timezone.utc)}
+    if owner_user_id is not None:
+        document["owner_user_id"] = owner_user_id
     with _write_lock:
         try:
             result = collection.update_one(query, {"$setOnInsert": document}, upsert=True)
@@ -305,23 +315,155 @@ def upsert_ci_analysis(project_id: str, payload: dict[str, Any]) -> tuple[dict[s
         saved = collection.find_one(query)
         if saved is None:
             raise PersistenceWriteError("CI analysis could not be stored.")
-        return _serialize(saved), bool(result and result.upserted_id is not None)
+        return _serialize_ci(saved), bool(result and result.upserted_id is not None)
 
 
-def list_ci_analyses(project_id: str, limit: int = 50) -> list[dict[str, Any]]:
+def list_ci_analyses(project_id: str, limit: int = 50, owner_user_id: str | None = None) -> list[dict[str, Any]]:
     database = get_database()
     with _write_lock:
-        documents = database["ci_analyses"].find({"project_id": project_id})
-        return [_serialize(document) for document in documents.sort("created_at", -1).limit(limit)]
+        query = {"project_id": project_id}
+        if owner_user_id is not None:
+            query["owner_user_id"] = owner_user_id
+        documents = database["ci_analyses"].find(query)
+        return [_serialize_ci(document) for document in documents.sort("created_at", -1).limit(limit)]
 
 
-def get_ci_analysis(project_id: str, analysis_id: str) -> dict[str, Any] | None:
+def get_ci_analysis(project_id: str, analysis_id: str, owner_user_id: str | None = None) -> dict[str, Any] | None:
     if not ObjectId.is_valid(analysis_id):
         return None
     database = get_database()
     with _write_lock:
-        document = database["ci_analyses"].find_one({
+        query = {
             "_id": ObjectId(analysis_id),
             "project_id": project_id,
-        })
-        return _serialize(document) if document else None
+        }
+        if owner_user_id is not None:
+            query["owner_user_id"] = owner_user_id
+        document = database["ci_analyses"].find_one(query)
+        return _serialize_ci(document) if document else None
+
+
+def upsert_github_user(github_id: int, login: str, avatar_url: str | None, repositories: list[dict[str, Any]]) -> dict[str, Any]:
+    """Store a GitHub identity and a public-repository snapshot; never store OAuth tokens."""
+    database = get_database()
+    users = database["users"]
+    users.create_index([("github_id", 1)], unique=True, name="github_user_unique")
+    users.update_one(
+        {"github_id": github_id},
+        {"$set": {
+            "github_login": login[:100],
+            "avatar_url": avatar_url,
+            "public_repositories": repositories,
+            "updated_at": datetime.now(timezone.utc),
+        }, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+    user = users.find_one({"github_id": github_id})
+    if user is None:
+        raise PersistenceWriteError("GitHub user could not be stored.")
+    return _serialize(user)
+
+
+def get_github_user(user_id: str, *, include_repositories: bool = False) -> dict[str, Any] | None:
+    if not ObjectId.is_valid(user_id):
+        return None
+    projection = None if include_repositories else {"public_repositories": 0}
+    user = get_database()["users"].find_one({"_id": ObjectId(user_id)}, projection)
+    return _serialize(user) if user else None
+
+
+def list_github_repositories(user_id: str) -> list[dict[str, Any]]:
+    user = get_github_user(user_id, include_repositories=True)
+    return user.get("public_repositories", []) if user else []
+
+
+def list_user_projects(user_id: str) -> list[dict[str, Any]]:
+    documents = get_database()["projects"].find({"owner_user_id": user_id})
+    result = []
+    for item in documents.sort("created_at", -1):
+        project = _serialize(item)
+        project.pop("owner_user_id", None)
+        result.append(project)
+    return result
+
+
+def get_user_project(user_id: str, project_id: str) -> dict[str, Any] | None:
+    identifier: Any = ObjectId(project_id) if ObjectId.is_valid(project_id) else project_id
+    item = get_database()["projects"].find_one({"_id": identifier, "owner_user_id": user_id})
+    return _serialize(item) if item else None
+
+
+def get_project(project_id: str) -> dict[str, Any] | None:
+    identifier: Any = ObjectId(project_id) if ObjectId.is_valid(project_id) else project_id
+    item = get_database()["projects"].find_one({"_id": identifier})
+    return _serialize(item) if item else None
+
+
+def select_repository_project(user_id: str, repository: dict[str, Any]) -> dict[str, Any]:
+    """Create or retrieve one private ConfigGuard project for a selected public repo."""
+    database = get_database()
+    collection = database["projects"]
+    collection.create_index(
+        [("owner_user_id", 1), ("github_repository_id", 1)],
+        unique=True,
+        name="user_github_repository_unique",
+    )
+    query = {"owner_user_id": user_id, "github_repository_id": repository["id"]}
+    collection.update_one(query, {"$setOnInsert": {
+        **query,
+        "repository": repository["full_name"],
+        "repository_url": repository["html_url"],
+        "default_branch": repository.get("default_branch", ""),
+        "created_at": datetime.now(timezone.utc),
+    }}, upsert=True)
+    project = collection.find_one(query)
+    if project is None:
+        raise PersistenceWriteError("Project could not be selected.")
+    result = _serialize(project)
+    result.pop("owner_user_id", None)
+    return result
+
+
+def create_auth_session(user_id: str, csrf_token: str | None = None) -> tuple[str, str]:
+    """Create a revocable server-side session; only its random ID is sent in the cookie."""
+    database = get_database()
+    collection = database["auth_sessions"]
+    collection.create_index([("session_hash", 1)], unique=True, name="auth_session_unique")
+    collection.create_index([("expires_at", 1)], expireAfterSeconds=0, name="auth_session_ttl")
+    session_id = secrets.token_urlsafe(32)
+    csrf = csrf_token or secrets.token_urlsafe(32)
+    collection.insert_one({
+        "session_hash": sha256(session_id.encode("ascii")).hexdigest(),
+        "user_id": user_id,
+        "csrf_token": csrf,
+        "created_at": datetime.now(timezone.utc),
+        "expires_at": datetime.now(timezone.utc) + timedelta(hours=8),
+    })
+    return session_id, csrf
+
+
+def get_auth_session(session_id: str) -> dict[str, Any] | None:
+    if not isinstance(session_id, str) or len(session_id) > 128:
+        return None
+    try:
+        digest = sha256(session_id.encode("ascii")).hexdigest()
+    except UnicodeEncodeError:
+        return None
+    session = get_database()["auth_sessions"].find_one({"session_hash": digest})
+    expires_at = session.get("expires_at") if session else None
+    if not isinstance(expires_at, datetime):
+        return None
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= datetime.now(timezone.utc):
+        return None
+    return session
+
+
+def delete_auth_session(session_id: str) -> None:
+    if isinstance(session_id, str) and len(session_id) <= 128:
+        try:
+            digest = sha256(session_id.encode("ascii")).hexdigest()
+        except UnicodeEncodeError:
+            return
+        get_database()["auth_sessions"].delete_many({"session_hash": digest})

@@ -158,15 +158,16 @@ test('a converted editor state sends the matching selected format and configurat
   await api.analyze('payments', config, switched.format, 3)
 })
 
-test('CI history API attaches the bearer token and supports an empty history', async (t) => {
+test('CI history API uses the browser session and supports an empty history', async (t) => {
   mockFetch(t, async (input, init) => {
     assert.equal(input, '/api/projects/payments/ci-analyses')
     assert.equal(init.method, undefined)
-    assert.equal(init.headers.Authorization, 'Bearer synthetic-dashboard-token')
+    assert.equal(init.credentials, 'same-origin')
+    assert.equal(init.headers.Authorization, undefined)
     return new Response('[]', { status: 200 })
   })
 
-  assert.deepEqual(await api.ciAnalyses('payments', 'synthetic-dashboard-token'), [])
+  assert.deepEqual(await api.ciAnalyses('payments'), [])
 })
 
 test('CI history detail API returns a sanitized PR record', async (t) => {
@@ -179,25 +180,61 @@ test('CI history detail API returns a sanitized PR record', async (t) => {
   }
   mockFetch(t, async (input, init) => {
     assert.equal(input, '/api/projects/payments/ci-analyses/ci-1')
-    assert.equal(init.headers.Authorization, 'Bearer synthetic-dashboard-token')
+    assert.equal(init.headers.Authorization, undefined)
     return new Response(JSON.stringify(record), { status: 200 })
   })
 
-  assert.deepEqual(await api.ciAnalysis('payments', 'ci-1', 'synthetic-dashboard-token'), record)
+  assert.deepEqual(await api.ciAnalysis('payments', 'ci-1'), record)
 })
 
-test('CI history API exposes safe authentication errors without echoing the token', async (t) => {
-  const token = 'synthetic-secret-token-must-not-echo'
+test('CI history API exposes safe session authentication errors', async (t) => {
   mockFetch(t, async (_input, init) => {
-    assert.equal(init.headers.Authorization, `Bearer ${token}`)
-    return new Response(JSON.stringify({ detail: 'CI integration authentication failed.' }), { status: 401 })
+    assert.equal(init.headers.Authorization, undefined)
+    return new Response(JSON.stringify({ detail: 'Authentication required.' }), { status: 401 })
   })
 
-  await assert.rejects(api.ciAnalyses('payments', token), (error) => {
-    assert.equal(error.message, 'CI integration authentication failed.')
-    assert.equal(error.message.includes(token), false)
+  await assert.rejects(api.ciAnalyses('payments'), (error) => {
+    assert.equal(error.message, 'Authentication required.')
     return true
   })
+})
+
+test('write requests include the session CSRF token and same-origin cookies', async (t) => {
+  api.setCsrfToken('synthetic-csrf-token')
+  mockFetch(t, async (_input, init) => {
+    assert.equal(init.credentials, 'same-origin')
+    assert.equal(init.headers['X-CSRF-Token'], 'synthetic-csrf-token')
+    return new Response(JSON.stringify({ id: 'version-1' }), { status: 201 })
+  })
+  await api.saveVersion('payments', { timeout: 30 }, 'json')
+  api.setCsrfToken(null)
+})
+
+test('auth session and selected-repository endpoints use same-origin sessions', async (t) => {
+  let requestCount = 0
+  mockFetch(t, async (input, init) => {
+    assert.equal(init.credentials, 'same-origin')
+    requestCount += 1
+    if (input === '/api/auth/me') return new Response(JSON.stringify({ authenticated: true, user: { id: 'u1', login: 'sample-user' }, csrf_token: 'csrf' }), { status: 200 })
+    if (input === '/api/github/repositories') return new Response(JSON.stringify([{ id: 7, full_name: 'sample-user/app' }]), { status: 200 })
+    assert.equal(init.headers['X-CSRF-Token'], 'csrf')
+    if (input === '/api/projects/select') {
+      assert.deepEqual(JSON.parse(init.body), { repository_id: 7 })
+      return new Response(JSON.stringify({ id: 'project-1', repository: 'sample-user/app' }), { status: 200 })
+    }
+    assert.equal(input, '/api/projects/activate')
+    assert.deepEqual(JSON.parse(init.body), { project_id: 'project-1' })
+    return new Response(JSON.stringify({ active_project_id: 'project-1' }), { status: 200 })
+  })
+
+  const session = await api.authMe()
+  api.setCsrfToken(session.csrf_token)
+  assert.equal(session.authenticated, true)
+  assert.equal((await api.repositories())[0].full_name, 'sample-user/app')
+  assert.equal((await api.selectProject(7)).id, 'project-1')
+  assert.equal((await api.activateProject('project-1')).active_project_id, 'project-1')
+  assert.equal(requestCount, 4)
+  api.setCsrfToken(null)
 })
 
 test('CI history view state covers loading, empty, success, and error states', () => {
