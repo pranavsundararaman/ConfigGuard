@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { api } from './api.ts'
+import { api, getCIHistoryDisplayState } from './api.ts'
 import { convertConfiguration, defaultConfigurationExample, parseConfiguration, planFormatSwitch, resolveFormatSwitch } from './configParser.ts'
 
 function mockFetch(t, implementation) {
@@ -156,4 +156,54 @@ test('a converted editor state sends the matching selected format and configurat
   })
   const config = await parseConfiguration(switched.content, switched.format)
   await api.analyze('payments', config, switched.format, 3)
+})
+
+test('CI history API attaches the bearer token and supports an empty history', async (t) => {
+  mockFetch(t, async (input, init) => {
+    assert.equal(input, '/api/projects/payments/ci-analyses')
+    assert.equal(init.method, undefined)
+    assert.equal(init.headers.Authorization, 'Bearer synthetic-dashboard-token')
+    return new Response('[]', { status: 200 })
+  })
+
+  assert.deepEqual(await api.ciAnalyses('payments', 'synthetic-dashboard-token'), [])
+})
+
+test('CI history detail API returns a sanitized PR record', async (t) => {
+  const record = {
+    id: 'ci-1', project_id: 'payments', repository: 'owner/service', pull_request_number: 27,
+    pull_request_url: 'https://github.com/owner/service/pull/27', base_sha: 'a'.repeat(40), head_sha: 'b'.repeat(40),
+    risk_score: 74.5, classification: 'HIGH_RISK', findings: [],
+    change_counts: { files_analyzed: 1, files_unchanged: 0, files_unavailable: 0, files_unsupported: 0, configuration_changes: 1, rule_findings: 1 },
+    created_at: '2026-10-24T00:00:00Z',
+  }
+  mockFetch(t, async (input, init) => {
+    assert.equal(input, '/api/projects/payments/ci-analyses/ci-1')
+    assert.equal(init.headers.Authorization, 'Bearer synthetic-dashboard-token')
+    return new Response(JSON.stringify(record), { status: 200 })
+  })
+
+  assert.deepEqual(await api.ciAnalysis('payments', 'ci-1', 'synthetic-dashboard-token'), record)
+})
+
+test('CI history API exposes safe authentication errors without echoing the token', async (t) => {
+  const token = 'synthetic-secret-token-must-not-echo'
+  mockFetch(t, async (_input, init) => {
+    assert.equal(init.headers.Authorization, `Bearer ${token}`)
+    return new Response(JSON.stringify({ detail: 'CI integration authentication failed.' }), { status: 401 })
+  })
+
+  await assert.rejects(api.ciAnalyses('payments', token), (error) => {
+    assert.equal(error.message, 'CI integration authentication failed.')
+    assert.equal(error.message.includes(token), false)
+    return true
+  })
+})
+
+test('CI history view state covers loading, empty, success, and error states', () => {
+  assert.equal(getCIHistoryDisplayState(false, false, false, false), 'connect')
+  assert.equal(getCIHistoryDisplayState(true, true, false, false), 'loading')
+  assert.equal(getCIHistoryDisplayState(true, false, false, false), 'empty')
+  assert.equal(getCIHistoryDisplayState(true, false, true, false), 'ready')
+  assert.equal(getCIHistoryDisplayState(true, false, false, true), 'error')
 })

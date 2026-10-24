@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from bson import ObjectId
 from fastapi.encoders import jsonable_encoder
-from pymongo.errors import OperationFailure
+from pymongo.errors import DuplicateKeyError, OperationFailure
 
 from .database import get_database
 
@@ -275,4 +275,53 @@ def get_analysis(project_id: str, analysis_id: str) -> dict[str, Any] | None:
             "_id": ObjectId(analysis_id),
             "project_id": project_id,
         }))
+        return _serialize(document) if document else None
+
+
+def upsert_ci_analysis(project_id: str, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Persist one sanitised CI report, deduplicating retries by PR head SHA."""
+    database = get_database()
+    collection = database["ci_analyses"]
+    unique_fields = [
+        ("project_id", 1),
+        ("repository", 1),
+        ("pull_request_number", 1),
+        ("head_sha", 1),
+    ]
+    collection.create_index(unique_fields, unique=True, name="ci_analysis_delivery_unique")
+    query = {
+        "project_id": project_id,
+        "repository": payload["repository"],
+        "pull_request_number": payload["pull_request_number"],
+        "head_sha": payload["head_sha"],
+    }
+    document = {**payload, **query, "created_at": datetime.now(timezone.utc)}
+    with _write_lock:
+        try:
+            result = collection.update_one(query, {"$setOnInsert": document}, upsert=True)
+        except DuplicateKeyError:
+            # A concurrent retry may insert after this request's upsert lookup.
+            result = None
+        saved = collection.find_one(query)
+        if saved is None:
+            raise PersistenceWriteError("CI analysis could not be stored.")
+        return _serialize(saved), bool(result and result.upserted_id is not None)
+
+
+def list_ci_analyses(project_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    database = get_database()
+    with _write_lock:
+        documents = database["ci_analyses"].find({"project_id": project_id})
+        return [_serialize(document) for document in documents.sort("created_at", -1).limit(limit)]
+
+
+def get_ci_analysis(project_id: str, analysis_id: str) -> dict[str, Any] | None:
+    if not ObjectId.is_valid(analysis_id):
+        return None
+    database = get_database()
+    with _write_lock:
+        document = database["ci_analyses"].find_one({
+            "_id": ObjectId(analysis_id),
+            "project_id": project_id,
+        })
         return _serialize(document) if document else None

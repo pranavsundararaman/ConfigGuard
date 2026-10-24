@@ -40,6 +40,11 @@ class FakeCollection:
         self.documents = []
         self.fail_insert = fail_insert
         self.fail_delete = fail_delete
+        self.indexes = []
+
+    def create_index(self, fields, **kwargs):
+        self.indexes.append((fields, kwargs))
+        return kwargs.get("name", "fake_index")
 
     def insert_one(self, document, **kwargs):
         if self.fail_insert:
@@ -55,12 +60,16 @@ class FakeCollection:
     def find_one(self, query):
         return next((doc.copy() for doc in self.documents if _matches(doc, query)), None)
 
-    def update_one(self, query, update):
+    def update_one(self, query, update, upsert=False):
         document = next((doc for doc in self.documents if _matches(doc, query)), None)
         if document is None:
-            return type("UpdateResult", (), {"matched_count": 0})()
+            if upsert:
+                stored = {**query, **update.get("$setOnInsert", {}), "_id": ObjectId()}
+                self.documents.append(stored)
+                return type("UpdateResult", (), {"matched_count": 0, "upserted_id": stored["_id"]})()
+            return type("UpdateResult", (), {"matched_count": 0, "upserted_id": None})()
         document.update(update.get("$set", {}))
-        return type("UpdateResult", (), {"matched_count": 1})()
+        return type("UpdateResult", (), {"matched_count": 1, "upserted_id": None})()
 
     def delete_many(self, query):
         if self.fail_delete:

@@ -161,3 +161,44 @@ Remove-Item Env:GITHUB_STEP_SUMMARY
 
 The CLI writes the same summary to standard output when `GITHUB_STEP_SUMMARY`
 is not set. To run the entire backend suite, use `python -m pytest -q`.
+
+## ConfigGuard V2.5 local CI report history
+
+The dashboard can display sanitised GitHub Actions reports ingested by the
+backend. This remains a local/manual integration: the V2.4 pull-request
+workflow still writes only its Actions step summary and does not send reports
+to an API or require a public backend URL.
+
+Set `CONFIGGUARD_CI_TOKEN` and `CONFIGGUARD_CI_READ_TOKEN` in the backend's
+ignored local `.env` file. The write token is reserved for report ingestion;
+enter the separate read token in the dashboard's **GitHub PR checks** page to
+load history. The frontend keeps the read token in page memory only. If the
+relevant setting is absent, its routes return a generic configuration error.
+Tokens are compared as bearer credentials and are never included in responses.
+
+Authenticated endpoints:
+
+- `POST /api/projects/{project_id}/ci-analyses` ingests a report.
+- `GET /api/projects/{project_id}/ci-analyses?limit=50` lists reports.
+- `GET /api/projects/{project_id}/ci-analyses/{analysis_id}` retrieves one report.
+
+Project IDs are validated slugs and every read is project-scoped. Repository
+names and pull-request URLs must identify the same `owner/repository` and PR on
+`https://github.com`. The backend bounds the JSON body and all lists/strings,
+accepts only risk classifications and known rule names, and rejects unknown
+fields. A compound unique index on project, repository, pull-request number,
+and head SHA makes retries idempotent. The stored record contains repository
+and pull-request metadata, commit SHAs, server-side analysis time, risk score,
+classification, sanitised parameter-level findings, and aggregate counts.
+Configuration contents, old/new values, parser errors, source excerpts, and
+free-form finding text are not accepted. Sensitive-labelled path components
+and parameter names are replaced before persistence.
+
+To test locally, set the token in `.env`, run the backend, and enter that token
+in the dashboard's **GitHub PR checks** page. A request body should contain
+only the documented metadata, `findings` with `file_path`, `parameter`,
+`change_type`, and whitelisted `rule_names`, plus the six integer fields in
+`change_counts`; it must not contain configuration values. CI history is
+stored separately from historical configuration analyses. No workflow-side
+submission is enabled until the backend has a reachable HTTPS deployment and
+an explicit workflow configuration is reviewed.
