@@ -1,6 +1,11 @@
 export type ConfigFormat = 'json' | 'yaml' | 'yml' | 'env'
 export type Lifecycle = 'proposed' | 'deployed'
 
+export interface GitHubUser { login: string; avatar_url?: string | null }
+export interface GitHubRepository { id: number; full_name: string; owner: string; name: string; html_url: string; default_branch: string }
+export interface OwnedProject { id: string; github_repository_id: number; repository: string; repository_url: string; default_branch: string }
+export interface AuthSession { authenticated: boolean; user: GitHubUser | null; csrf_token: string | null; active_project_id?: string }
+
 export interface ConfigVersion {
   id: string
   project_id: string
@@ -120,9 +125,15 @@ export function normalizeHistoricalResults(value: unknown): HistoricalResult[] {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response
   try {
+    const method = (init?.method || 'GET').toUpperCase()
     response = await fetch(path, {
       ...init,
-      headers: { 'Content-Type': 'application/json', ...init?.headers },
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(method !== 'GET' && csrfToken ? { 'X-CSRF-Token': csrfToken } : {}),
+        ...init?.headers,
+      },
     })
   } catch {
     throw new Error('Cannot reach ConfigGuard API. Start the backend at http://localhost:8000 and try again.')
@@ -139,9 +150,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+let csrfToken: string | null = null
+
 const projectPath = (projectId: string) => `/api/projects/${encodeURIComponent(projectId)}`
 
 export const api = {
+  setCsrfToken: (value: string | null) => { csrfToken = value },
+  authMe: () => request<AuthSession>('/api/auth/me'),
+  logout: () => request<{ authenticated: boolean }>('/api/auth/logout', { method: 'POST' }),
+  repositories: () => request<GitHubRepository[]>('/api/github/repositories'),
+  projects: () => request<OwnedProject[]>('/api/projects'),
+  selectProject: (repository_id: number) => request<OwnedProject>('/api/projects/select', { method: 'POST', body: JSON.stringify({ repository_id }) }),
+  activateProject: (project_id: string) => request<{ active_project_id: string }>('/api/projects/activate', { method: 'POST', body: JSON.stringify({ project_id }) }),
   health: () => request<{ status: string; service: string }>('/api/health'),
   parseConfig: (content: string, format: ConfigFormat) =>
     request<{ configuration: Record<string, unknown> }>('/api/parse-config', {
@@ -158,12 +178,8 @@ export const api = {
     request<AnalysisRecord>(`${projectPath(projectId)}/historical-analysis`, {
       method: 'POST', body: JSON.stringify({ configuration, format, min_observations }),
     }),
-  ciAnalyses: (projectId: string, token: string) =>
+  ciAnalyses: (projectId: string) =>
     request<CIAnalysisRecord[]>(`${projectPath(projectId)}/ci-analyses`, {
-      headers: { Authorization: `Bearer ${token}` },
     }),
-  ciAnalysis: (projectId: string, id: string, token: string) =>
-    request<CIAnalysisRecord>(`${projectPath(projectId)}/ci-analyses/${encodeURIComponent(id)}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    }),
+  ciAnalysis: (projectId: string, id: string) => request<CIAnalysisRecord>(`${projectPath(projectId)}/ci-analyses/${encodeURIComponent(id)}`),
 }

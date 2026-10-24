@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, AlertCircle, ArrowDownRight, ArrowUpRight, Check, CheckCircle2, ChevronRight, Clock3, Code2, FileClock, FilePlus2, FolderKanban, Gauge, GitPullRequest, History, Layers3, LoaderCircle, Play, RefreshCw, Search, Shield, ShieldAlert, ShieldCheck, TriangleAlert, X } from 'lucide-react'
-import { api, getCIHistoryDisplayState, normalizeHistoricalResults, normalizeLimitations, normalizeStringList, type AnalysisRecord, type CIAnalysisRecord, type ConfigFormat, type ConfigVersion, type HistoricalResult } from './api'
+import { api, getCIHistoryDisplayState, normalizeHistoricalResults, normalizeLimitations, normalizeStringList, type AnalysisRecord, type AuthSession, type CIAnalysisRecord, type ConfigFormat, type ConfigVersion, type GitHubRepository, type GitHubUser, type OwnedProject, type HistoricalResult } from './api'
 import { defaultConfigurationExample, planFormatSwitch, resolveFormatSwitch, type FormatSwitchChoice, type FormatSwitchPlan, parseConfiguration } from './configParser'
 import './App.css'
 
@@ -21,14 +21,17 @@ function formatDate(value?: string) {
 function asError(error: unknown) { return error instanceof Error ? error.message : 'Something went wrong. Please try again.' }
 function App() {
   const [view, setView] = useState<View>('analyze')
-  const [projectId, setProjectId] = useState(() => localStorage.getItem('configguard-project') || 'configguard-demo')
-  const [projectDraft, setProjectDraft] = useState(projectId)
+  const [projectId, setProjectId] = useState('')
+  const [projects, setProjects] = useState<OwnedProject[]>([])
+  const [repositories, setRepositories] = useState<GitHubRepository[]>([])
+  const [repositoryToAdd, setRepositoryToAdd] = useState('')
+  const [authLoading, setAuthLoading] = useState(true)
+  const [currentUser, setCurrentUser] = useState<GitHubUser | null>(null)
+  const [, setCsrfToken] = useState<string | null>(null)
   const [health, setHealth] = useState<'checking' | 'online' | 'offline'>('checking')
   const [versions, setVersions] = useState<ConfigVersion[]>([])
   const [analyses, setAnalyses] = useState<AnalysisRecord[]>([])
   const [ciAnalyses, setCiAnalyses] = useState<CIAnalysisRecord[]>([])
-  const [ciToken, setCiToken] = useState('')
-  const [ciTokenDraft, setCiTokenDraft] = useState('')
   const [selectedCiAnalysis, setSelectedCiAnalysis] = useState<CIAnalysisRecord | null>(null)
   const [ciHistoryStatus, setCiHistoryStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
   const [loading, setLoading] = useState(false)
@@ -53,16 +56,15 @@ function App() {
   const refresh = useCallback(async () => {
     if (!projectId.trim()) return
     setLoading(true); setPageError('')
-    setCiHistoryStatus(ciToken ? 'loading' : 'idle')
+    setCiHistoryStatus('loading')
     const [versionsResult, analysesResult, ciResult] = await Promise.allSettled([
       api.versions(projectId),
       api.analyses(projectId),
-      ciToken ? api.ciAnalyses(projectId, ciToken) : Promise.resolve(null),
+      api.ciAnalyses(projectId),
     ])
     if (versionsResult.status === 'fulfilled') setVersions(versionsResult.value)
     if (analysesResult.status === 'fulfilled') setAnalyses(analysesResult.value)
-    if (!ciToken) setCiAnalyses([])
-    else if (ciResult.status === 'fulfilled' && ciResult.value) {
+    if (ciResult.status === 'fulfilled') {
       setCiAnalyses(ciResult.value); setCiHistoryStatus('ready')
     } else {
       setCiAnalyses([]); setCiHistoryStatus('error')
@@ -70,11 +72,30 @@ function App() {
     const failure = [versionsResult, analysesResult, ciResult].find((result) => result.status === 'rejected')
     if (failure?.status === 'rejected') setPageError(asError(failure.reason))
     setLoading(false)
-  }, [ciToken, projectId])
+  }, [projectId])
 
   useEffect(() => {
     let active = true
     api.health().then(() => { if (active) setHealth('online') }).catch(() => { if (active) setHealth('offline') })
+    return () => { active = false }
+  }, [])
+  useEffect(() => {
+    let active = true
+    api.authMe().then(async (session: AuthSession) => {
+      if (!active) return
+      if (!session.authenticated || !session.user) { setCurrentUser(null); return }
+      setCurrentUser(session.user)
+      setCsrfToken(session.csrf_token)
+      api.setCsrfToken(session.csrf_token)
+      const [owned, available] = await Promise.all([api.projects(), api.repositories()])
+      if (!active) return
+      setProjects(owned); setRepositories(available)
+      const selected = owned.find((project) => project.id === session.active_project_id) ?? owned[0]
+      if (selected) {
+        setProjectId(selected.id)
+        if (selected.id !== session.active_project_id) await api.activateProject(selected.id)
+      }
+    }).catch((error) => { if (active) setPageError(asError(error)) }).finally(() => { if (active) setAuthLoading(false) })
     return () => { active = false }
   }, [])
   // Project changes trigger a backend refresh, including the initial project load.
@@ -85,12 +106,30 @@ function App() {
   const proposalCount = versions.filter((item) => item.lifecycle === 'proposed').length
   const latestActivity = useMemo(() => [...versions.map((item) => item.created_at), ...analyses.map((item) => item.created_at)].filter(Boolean).sort().at(-1), [versions, analyses])
 
-  function changeProject(event: React.FormEvent) {
-    event.preventDefault()
-    const next = projectDraft.trim()
-    if (!next) return
-    setProjectId(next); localStorage.setItem('configguard-project', next)
-    setLatestAnalysis(null); setSelectedAnalysis(null); setSelectedCiAnalysis(null); setCiAnalyses([]); setPageError('')
+  async function changeProject(next: string) {
+    if (!next || next === projectId) return
+    setPageError('')
+    try {
+      await api.activateProject(next)
+      setProjectId(next)
+      setLatestAnalysis(null); setSelectedAnalysis(null); setSelectedCiAnalysis(null); setCiAnalyses([])
+    } catch (error) { setPageError(asError(error)) }
+  }
+
+  async function addRepository(repositoryId = repositoryToAdd) {
+    const repository = repositories.find((item) => String(item.id) === repositoryId)
+    if (!repository) return
+    setPageError('')
+    try {
+      const project = await api.selectProject(repository.id)
+      const owned = await api.projects()
+      setProjects(owned); setProjectId(project.id); setRepositoryToAdd('')
+    } catch (error) { setPageError(asError(error)) }
+  }
+
+  async function signOut() {
+    try { await api.logout() } catch { /* Clear local state even if the session expired. */ }
+    api.setCsrfToken(null); setCsrfToken(null); setCurrentUser(null); setProjects([]); setProjectId('')
   }
 
   async function parseEditor(nextText = configText, nextFormat = format) {
@@ -157,6 +196,7 @@ function App() {
 
   async function runAnalysis(event: React.FormEvent) {
     event.preventDefault()
+    if (!projectId) { setPageError('Select a repository project before running analysis.'); return }
     const object = await parseEditor()
     const minimum = Number(minObservations)
     if (!object || !Number.isInteger(minimum) || minimum < 3 || minimum > 100) {
@@ -171,6 +211,7 @@ function App() {
   }
 
   async function saveVersion() {
+    if (!projectId) { setPageError('Select a repository project before saving a configuration.'); return }
     const object = await parseEditor()
     if (!object) return
     setSavingVersion(true); setPageError('')
@@ -192,24 +233,29 @@ function App() {
 
   async function openCiAnalysis(analysis: CIAnalysisRecord) {
     setSelectedCiAnalysis(analysis)
-    if (!ciToken) return
-    try { setSelectedCiAnalysis(await api.ciAnalysis(projectId, analysis.id, ciToken)) }
+    try { setSelectedCiAnalysis(await api.ciAnalysis(projectId, analysis.id)) }
     catch (error) { setPageError(asError(error)) }
   }
 
   const filteredVersions = versions.filter((item) => `${item.id} ${item.format} ${item.lifecycle}`.toLowerCase().includes(filter.toLowerCase()))
-  const ciDisplayState = getCIHistoryDisplayState(Boolean(ciToken), ciHistoryStatus === 'loading' || loading, ciAnalyses.length > 0, ciHistoryStatus === 'error')
+  const ciDisplayState = getCIHistoryDisplayState(Boolean(currentUser), ciHistoryStatus === 'loading' || loading, ciAnalyses.length > 0, ciHistoryStatus === 'error')
   const title = NAV.find((item) => item.id === view)?.title ?? 'Overview'
+
+  if (authLoading) return <div className="auth-gate"><div className="panel"><LoaderCircle className="spin" size={20} /><p>Checking your ConfigGuard session…</p></div></div>
+  if (!currentUser) return <div className="auth-gate"><div className="panel auth-panel"><span className="brand-mark"><Shield size={20} /></span><div className="eyebrow">CONFIGGUARD WORKSPACE</div><h1>Sign in with GitHub</h1><p>Connect your account to select public repositories and view project history securely.</p><a className="button primary" href="/api/auth/github/login">Continue with GitHub</a><small>ConfigGuard requests read-only profile access and lists public repositories only.</small></div></div>
 
   return <div className="app-shell">
     <aside className="sidebar">
       <a className="brand" href="#overview" onClick={(event) => { event.preventDefault(); setView('overview') }}><span className="brand-mark"><Shield size={19} strokeWidth={2.4} /></span><span>config<span className="brand-light">guard</span><small>CONFIG RISK INTELLIGENCE</small></span></a>
       <div className="side-label">WORKSPACE</div>
-      <form className="project-box" onSubmit={changeProject}>
-        <label htmlFor="project-id">PROJECT</label>
-        <div className="project-input-wrap"><FolderKanban size={15} /><input id="project-id" value={projectDraft} onChange={(event) => setProjectDraft(event.target.value)} aria-label="Project identifier" /></div>
-        <button type="submit" className="change-project">Open project <ChevronRight size={14} /></button>
-      </form>
+      <div className="project-box">
+        <label htmlFor="project-id">SELECTED PROJECT</label>
+        <div className="project-input-wrap"><FolderKanban size={15} /><select id="project-id" value={projectId} onChange={(event) => void changeProject(event.target.value)} aria-label="Selected project">
+          <option value="">Choose a repository project</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.repository}</option>)}
+        </select></div>
+        {repositories.length > 0 && <><label htmlFor="repository-to-add" className="repo-add-label">ADD PUBLIC REPOSITORY</label><select id="repository-to-add" value={repositoryToAdd} onChange={(event) => setRepositoryToAdd(event.target.value)}><option value="">Choose repository…</option>{repositories.map((repository) => <option key={repository.id} value={repository.id}>{repository.full_name}</option>)}</select><button type="button" className="change-project" disabled={!repositoryToAdd} onClick={() => void addRepository()}>Add repository <ChevronRight size={14} /></button></>}
+        <button type="button" className="change-project" onClick={() => void signOut()}>Sign out @{currentUser.login}</button>
+      </div>
       <div className="side-label nav-label">ANALYSIS</div>
       <nav className="main-nav" aria-label="Main navigation">
         {NAV.map(({ id, title: label, icon: Icon }) => <button key={id} className={`nav-item ${view === id ? 'active' : ''}`} onClick={() => { setView(id); setPageError('') }}><Icon size={17} /><span>{label}</span>{id === 'configurations' && versions.length > 0 && <small>{versions.length}</small>}</button>)}
@@ -218,7 +264,7 @@ function App() {
     </aside>
 
     <main className="main-panel">
-      <header className="topbar"><div className="breadcrumb"><span>Workspace</span><ChevronRight size={14} /><strong>{title}</strong></div><div className="top-actions"><span className="project-chip"><span className="mini-dot" />{projectId}</span><button className="icon-button" title="Refresh project data" onClick={() => void refresh()} disabled={loading}><RefreshCw size={16} className={loading ? 'spin' : ''} /></button><div className="avatar">CG</div></div></header>
+      <header className="topbar"><div className="breadcrumb"><span>Workspace</span><ChevronRight size={14} /><strong>{title}</strong></div><div className="top-actions"><span className="project-chip"><span className="mini-dot" />{projects.find((item) => item.id === projectId)?.repository || 'No project selected'}</span><select className="mobile-project-select" value={projectId ? `project:${projectId}` : ''} aria-label="Switch or add repository" onChange={(event) => { const [kind, id] = event.target.value.split(':'); if (kind === 'project') void changeProject(id); else if (kind === 'repo') void addRepository(id) }}><option value="">Select repository</option><optgroup label="Your projects">{projects.map((project) => <option key={project.id} value={`project:${project.id}`}>{project.repository}</option>)}</optgroup><optgroup label="Add public repository">{repositories.filter((repository) => !projects.some((project) => project.github_repository_id === repository.id)).map((repository) => <option key={repository.id} value={`repo:${repository.id}`}>{repository.full_name}</option>)}</optgroup></select><button className="icon-button" title="Refresh project data" onClick={() => void refresh()} disabled={loading || !projectId}><RefreshCw size={16} className={loading ? 'spin' : ''} /></button><div className="avatar">{currentUser.login.slice(0, 2).toUpperCase()}</div></div></header>
       <div className="content">
         {pageError && <div className="alert error-alert" role="alert"><AlertCircle size={17} /><span>{pageError}</span><button onClick={() => setPageError('')} aria-label="Dismiss error"><X size={15} /></button></div>}
         {view === 'overview' && <Overview projectId={projectId} versions={versions} analyses={analyses} deployedCount={deployedCount} proposalCount={proposalCount} latestActivity={latestActivity} loading={loading} setView={setView} openAnalysis={openAnalysis} />}
@@ -231,7 +277,7 @@ function App() {
             <div id="format-note" className="format-note"><AlertCircle size={14} /> ENV uses underscore-separated paths; underscores are path separators by convention. ENV values are text and numeric/boolean values are normalized by the backend parser. Only numeric values are assessed by historical analysis.</div>
             <div className="editor-footer"><label className="minimum-setting">MIN. OBSERVATIONS <input type="number" min={3} max={100} step={1} value={minObservations} onChange={(event) => setMinObservations(event.target.value)} aria-label="Minimum historical observations" /></label><span className="muted tiny">At least 3 required by the API</span></div>
             {editorError && <div className="inline-error" role="alert"><AlertCircle size={15} />{editorError}</div>}
-            <div className="form-actions"><button type="button" className="button secondary" onClick={() => void saveVersion()} disabled={savingVersion || formatSwitching || Boolean(formatSwitchPlan)}>{savingVersion ? <LoaderCircle className="spin" size={16} /> : <FilePlus2 size={16} />} Save as proposal</button><button type="submit" className="button primary" disabled={analyzing || formatSwitching || Boolean(formatSwitchPlan)}>{analyzing ? <LoaderCircle className="spin" size={16} /> : <Play size={15} fill="currentColor" />} Run historical analysis</button></div>
+            <div className="form-actions"><button type="button" className="button secondary" onClick={() => void saveVersion()} disabled={!projectId || savingVersion || formatSwitching || Boolean(formatSwitchPlan)}>{savingVersion ? <LoaderCircle className="spin" size={16} /> : <FilePlus2 size={16} />} Save as proposal</button><button type="submit" className="button primary" disabled={!projectId || analyzing || formatSwitching || Boolean(formatSwitchPlan)}>{analyzing ? <LoaderCircle className="spin" size={16} /> : <Play size={15} fill="currentColor" />} Run historical analysis</button></div>
           </form>
             <aside className="panel guidance-panel"><div className="guidance-icon"><ShieldCheck size={20} /></div><h2>Historical analysis</h2><p>Compares numeric values against prior deployed versions in <strong>{projectId}</strong>.</p><div className="guidance-rule" /><div className="guidance-row"><span>Baseline source</span><strong>Deployed only</strong></div><div className="guidance-row"><span>Minimum sample</span><strong>{minObservations || 3} observations</strong></div><div className="guidance-row"><span>Proposal lifecycle</span><strong>Not auto-deployed</strong></div><div className="advisory-note"><TriangleAlert size={15} /><span>Unusual values suggest review. They do not predict deployment failure.</span></div></aside>
           </div>
@@ -247,14 +293,7 @@ function App() {
           {selectedAnalysis && <AnalysisResult analysis={selectedAnalysis} onOpenHistory={() => setSelectedAnalysis(null)} />}
         </section>}
         {view === 'ci-analyses' && <section className="page-section"><PageHeading eyebrow="GITHUB ACTIONS" title="Pull request analyses" description="Review sanitised, advisory CI reports associated with this project." />
-          <form className="panel ci-access-panel" onSubmit={(event) => { event.preventDefault(); setPageError(''); setSelectedCiAnalysis(null); setCiToken(ciTokenDraft.trim()) }}>
-            <label htmlFor="ci-access-token">CI dashboard read token</label>
-            <input id="ci-access-token" type="password" autoComplete="off" value={ciTokenDraft} onChange={(event) => setCiTokenDraft(event.target.value)} placeholder="Enter CONFIGGUARD_CI_READ_TOKEN" />
-            <button className="button secondary" type="submit">Connect</button>
-            <small>The token stays in memory for this page session and is sent only to this ConfigGuard API.</small>
-            {ciToken && <button className="quiet-action ci-forget" type="button" onClick={() => { setCiToken(''); setCiTokenDraft(''); setCiAnalyses([]); setSelectedCiAnalysis(null); setCiHistoryStatus('idle'); setPageError('') }}>Forget token</button>}
-          </form>
-          {ciDisplayState === 'connect' ? <EmptyState icon={<GitPullRequest size={21} />} title="Connect to view CI history" description="Enter the backend CI integration token to load project-scoped pull request reports." /> : ciDisplayState === 'error' ? <EmptyState icon={<AlertCircle size={21} />} title="Could not load CI history" description="Check the token and confirm the backend CI integration is configured." /> : ciDisplayState === 'ready' ? <div className="analysis-history">{ciAnalyses.map((analysis) => <button key={analysis.id} className={`history-row ${selectedCiAnalysis?.id === analysis.id ? 'selected' : ''}`} onClick={() => void openCiAnalysis(analysis)}><span className="history-symbol"><GitPullRequest size={17} /></span><span className="history-main"><strong>{analysis.repository} #{analysis.pull_request_number} · {analysis.classification.replaceAll('_', ' ')}</strong><small>Score {analysis.risk_score.toFixed(2)} · {analysis.change_counts.configuration_changes} changes · {analysis.findings.length} findings</small></span><span className="history-date">{formatDate(analysis.created_at)}</span><ChevronRight size={16} className="history-chevron" /></button>)}</div> : <EmptyState icon={<GitPullRequest size={21} />} title={ciDisplayState === 'loading' ? 'Loading pull request history…' : 'No CI analyses yet'} description={ciDisplayState === 'loading' ? 'Fetching authenticated project reports.' : 'No GitHub Actions reports have been ingested for this project.'} />}
+          {!projectId ? <EmptyState icon={<GitPullRequest size={21} />} title="Select a repository" description="Choose one of your selected repository projects to view its authenticated pull request history." /> : ciDisplayState === 'error' ? <EmptyState icon={<AlertCircle size={21} />} title="Could not load CI history" description="Refresh your session and confirm the backend CI integration is available." /> : ciDisplayState === 'ready' ? <div className="analysis-history">{ciAnalyses.map((analysis) => <button key={analysis.id} className={`history-row ${selectedCiAnalysis?.id === analysis.id ? 'selected' : ''}`} onClick={() => void openCiAnalysis(analysis)}><span className="history-symbol"><GitPullRequest size={17} /></span><span className="history-main"><strong>{analysis.repository} #{analysis.pull_request_number} · {analysis.classification.replaceAll('_', ' ')}</strong><small>Score {analysis.risk_score.toFixed(2)} · {analysis.change_counts.configuration_changes} changes · {analysis.findings.length} findings</small></span><span className="history-date">{formatDate(analysis.created_at)}</span><ChevronRight size={16} className="history-chevron" /></button>)}</div> : <EmptyState icon={<GitPullRequest size={21} />} title={ciDisplayState === 'loading' ? 'Loading pull request history…' : 'No CI analyses yet'} description={ciDisplayState === 'loading' ? 'Fetching authenticated project reports.' : 'No GitHub Actions reports have been ingested for this project.'} />}
           {selectedCiAnalysis && <CIAnalysisDetail analysis={selectedCiAnalysis} />}
         </section>}
       </div>

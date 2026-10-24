@@ -10,6 +10,8 @@
 .project-box label { display:block; font-size:9px; letter-spacing:1px; font-weight:700; color:#8ea0b2; margin-bottom:8px; }
 .project-input-wrap { height:34px; display:flex; gap:7px; align-items:center; padding:0 8px; border:1px solid #3d4d5d; border-radius:5px; color:#91a1b1; background:#182635; }
 .project-input-wrap input { min-width:0; flex:1; color:#eff5fa; background:transparent; border:0; outline:none; font-size:12px; }
+.project-input-wrap select,.project-box>select { min-width:0; width:100%; border:1px solid #3d4d5d; border-radius:4px; padding:7px; color:#eff5fa; background:#182635; font-size:10px; }
+.repo-add-label { margin-top:12px; }
 .change-project { border:0; background:none; padding:9px 0 0; color:#83b2f4; display:flex; gap:4px; align-items:center; font-size:11px; font-weight:600; }
 .nav-label { margin-top:32px; }
 .main-nav { display:grid; gap:4px; }
@@ -54,6 +56,12 @@
 .format-dialog h2 { margin:14px 0 7px; color:#2e3943; font-size:17px; }.format-dialog p { margin:0; color:#6f7b85; font-size:11px; line-height:1.65; }
 .format-dialog-error { display:flex; gap:7px; align-items:flex-start; margin-top:13px; padding:9px; border:1px solid #f0d6cf; border-radius:5px; color:#9d503e; background:#fff8f6; font-size:10px; line-height:1.5; }.format-dialog-error svg { flex:none; }
 .format-dialog-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; margin-top:19px; padding-top:14px; border-top:1px solid #edf0f2; }.format-dialog-actions .button:disabled { cursor:not-allowed; opacity:.5; }.format-dialog-actions .button.quiet { border:1px solid transparent; color:#596672; background:transparent; }
+.auth-gate { min-height:100vh; display:grid; place-items:center; padding:24px; background:#f4f6f8; }
+.auth-panel { width:min(100%,410px); display:flex; flex-direction:column; align-items:flex-start; gap:12px; padding:28px; }
+.auth-panel h1 { margin:0; color:#303b45; font-size:22px; }
+.auth-panel p { margin:0 0 8px; color:#77838d; font-size:12px; line-height:1.6; }
+.auth-panel small { color:#89949e; font-size:10px; line-height:1.5; }
+.auth-gate>.panel { display:flex; align-items:center; gap:10px; padding:20px; color:#77838d; }
 @media (max-width:460px) { .format-dialog { padding:18px; }.format-dialog-actions { flex-direction:column; }.format-dialog-actions .button { width:100%; } }
 
 .ci-access-panel { display:grid; grid-template-columns:minmax(180px,1fr) auto auto; align-items:center; gap:10px; padding:14px 16px; }

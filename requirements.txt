@@ -6,3 +6,4 @@ python-dotenv
 pymongo
 pytest
 httpx
+Authlib>=1.3,<2
